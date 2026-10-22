@@ -390,8 +390,17 @@ class RoboTwinDataset(BaseDataset):
         self._episode_lengths = []
         self._action_dim_detected = None
 
+        self._constraint_bundles = {}
+        self._embedded_instructions = {}
+        from openwam.train.constraint_schema import read_embedded
         for path in self._episode_files:
             with h5py.File(path, "r") as f:
+                bundle = read_embedded(f)
+                if bundle is not None:
+                    self._constraint_bundles[os.path.realpath(path)] = bundle
+                    instruction = f.attrs.get("instruction")
+                    if isinstance(instruction, str) and instruction.strip():
+                        self._embedded_instructions[os.path.realpath(path)] = instruction
                 T = f[f"observation/{target_camera}/rgb"].shape[0]
                 self._episode_lengths.append(T)
 
@@ -699,6 +708,9 @@ class RoboTwinDataset(BaseDataset):
         pure helper so tests and downstream adapters don't need a fully
         constructed ``RoboTwinDataset`` to reproduce training-time prompts.
         """
+        embedded = getattr(self, "_embedded_instructions", {}).get(os.path.realpath(self._episode_files[ep_idx]))
+        if embedded is not None:
+            return format_prompt_for_inference(embedded)
         return _resolve_prompt(
             instructions=self._instructions,
             ep_file=self._episode_files[ep_idx],
@@ -844,6 +856,7 @@ class RoboTwinDataset(BaseDataset):
             "vace_video": None,
             "first_frame_image": [sampled_video[0]],
             "action": action_tensor,
+            "trajectory_constraints": getattr(self, "_constraint_bundles", {}).get(os.path.realpath(path)),
             "action_mask": action_mask,
             "video_mask": video_mask,
             "proprio": proprio_tensor,

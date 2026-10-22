@@ -407,7 +407,7 @@ entry points for using and extending the repository:
 | [Architecture extension](assets/openwam_usage_docs/architecture-extension.md) | extend a video, visual, VLM, action backbone, or WAM architecture |
 | [Benchmark integration](assets/openwam_usage_docs/benchmark-integration.md) | extend a dataloader and connect a benchmark client to the WebSocket protocol |
 | [OpenWAM-α fine-tuning](assets/openwam_usage_docs/openwam-alpha-finetuning.md) | fine-tune the released foundation checkpoint to execute downstream task |
-| [RoboTwin constraint supervision](assets/openwam_usage_docs/robotwin-constraint-supervision.md) | add optional verified geometric supervision to clean-only EEF training |
+| [RoboTwin constraint supervision](assets/openwam_usage_docs/robotwin-constraint-supervision.md) | train with composable geometric constraints embedded in clean EEF data |
 
 > 💡 **Agent tip:** Pick the guide that matches your task and feed it directly
 > to your agent — less explaining, more building.

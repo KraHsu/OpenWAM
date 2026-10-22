@@ -1,182 +1,150 @@
-# RoboTwin clean-only constraint supervision
+# Embedded geometric constraints
 
-This experimental training objective adds REACH, CLEARANCE and ORIENTATION
-supervision to OpenWAM's existing action/video flow matching. It is disabled by
-default. The first implementation supports `dual_system / joint_self_attn`,
-RoboTwin `clean_50`, training split, and absolute EEF actions (20D or their
-80D unified mapping). It uses existing demonstrations and requires no RAX
-runtime or new trajectory collection.
+Constraints are part of each recorded HDF5 episode, at
+`trajectory_constraints/json`. There are **no operation categories**. RAX writes
+and revises base constraints during clean RoboTwin recording. Training reads
+the annotations with the action data; it does not invoke RAX, a simulator, an
+object dynamics model or a separate annotation manifest.
 
-The local development machine only needs code checks and small CPU tests.
-Model weights, training dependencies, RoboTwin assets and simulation belong on
-the GPU server. No download or installation is performed by this feature.
+## Physical quantities and losses
 
-## Loss and scope
+Let the decoded EEF position/orientation/opening be `p, R, g`. A fixed reference
+frame has world origin `o` and rotation `Q`; a unit annotation axis `n` becomes
+`a = Q n` in world coordinates. For each scalar `u` and interval `[l,h]`:
 
-For the existing action flow convention,
-`a_sigma = (1-sigma) * action + sigma * noise`, the model predicts velocity
-`v = noise - action`. The differentiable clean estimate is
-`a_hat = a_sigma - sigma * v_pred`. The callback runs after the forward pass,
-outside the reader and `prepare_inputs()`'s no-grad context.
-
-The decoder first undoes the unified action mapping, then applies the reader's
-exact inverse affine normalization. Geometry is evaluated in float32:
-
-- REACH: distance outside a world-coordinate target ball; zero anywhere inside.
-- CLEARANCE: shortfall of the **lowest transformed object vertex** below a
-  world z threshold. Requires object geometry and an independently verified
-  rigid EEF-to-object transform valid throughout the annotated interval.
-- ORIENTATION: angular error of one local axis against a world target axis,
-  beyond a tolerance. Rotation about that axis remains free.
-
-The constraint loss averages squared, scale-normalized residuals across valid
-frames within each active constraint, then averages active constraints across
-the distributed microbatch. The configured weight multiplies this mean. The
-original action FM and video FM terms retain their weights. Annotation density
-and sliding-window overlap therefore affect sampling; use the same windows and
-manifest in comparative runs. Gradient accumulation averages microbatch losses.
-
-These are geometric losses on a **single-step estimate from noised training
-actions**. They do not differentiate through contact dynamics or guarantee
-execution success. Object supervision assumes the verified rigid grasp persists;
-exclude slip, grasp transitions and unknown attachment intervals. Position units,
-world frame, tool origin and quaternion conventions must match the dataset.
-
-## Annotation contract
-
-Supply a JSONL manifest: one constraint per line. `episode_id` is the canonical
-POSIX path relative to `dataloader.dataset_dir`, including task, embodiment,
-variant and HDF5 filename. Intervals use raw observation indices `[start, end)`;
-they are unrelated to the video subsampling stride. A sample beginning at `s`
-predicts actions for frames `s+1, s+2, ...`. An endpoint constraint applies only
-to `end-1`; it is never moved to the end of a shorter window. Padding and
-unobserved action dimensions are excluded.
-
-Illustrative **proposed** label (coordinates and report IDs must come from your
-own annotations; this example is not verified training data):
-
-```json
-{
-  "schema_version": "0.1",
-  "episode_id": "adjust_bottle/aloha-agilex_clean_50/data/episode0.hdf5",
-  "segment_id": "reach-0",
-  "primitive": "REACH",
-  "interval": {"start": 10, "end": 31},
-  "constraint": {
-    "type": "REACH",
-    "version": "1",
-    "subject": "robot_eef:left",
-    "frame": "world",
-    "scope": "endpoint",
-    "parameters": {"center_m": [0.1, 0.2, 0.8], "radius_m": 0.03, "scale_m": 0.03}
-  },
-  "evidence": {"source": "manual", "verification_status": "proposed"},
-  "provenance": {"split": "train", "variant": "clean_50"}
-}
+```
+v(u) = relu(l - u) + relu(u - h)
+L_i = mean_over_valid_frames((v(u) / scale_i) ** power_i)
+L_constraint = sum_i(weight_i * L_i) / sum_i(weight_i)
+L_total = L_existing_FM + training.constraints.weight * L_constraint
 ```
 
-Accepted labels require a nonempty `evidence.report_id`. This is a reference to
-verification evidence, not proof supplied by the parser. The parser validates
-the contract; it does not verify the physical truth of annotations or generate
-simulator ground truth from existing HDF5 files. Proposed, rejected and unknown
-labels are counted but excluded from the loss. A manifest without any accepted
-labels, or with no accepted labels matching selected episodes, is rejected.
-`demonstration_proxy` labels require the explicit
-`training.constraints.allow_demonstration_proxy=true` opt-in and must be reported
-separately from simulator-ground-truth experiments.
+An empty valid set contributes a connected zero, not a false success. Averaging
+uses active weights globally across DDP ranks. `power=2` is `squared_hinge`;
+`power=4` is `quartic_hinge`. Both give zero inside the allowed interval and
+continuous gradients at its boundary. At violation/scale > 1, the fourth power
+grows faster. Weight and scale have distinct roles: mixture importance versus
+physical normalization. The original action/video FM coefficients remain active.
 
-| Type | Required parameters | Subjects |
+| Base type | Scalar u | Bounds / scale units |
 | --- | --- | --- |
-| REACH | `center_m[3]`, `radius_m >= 0`, `scale_m > 0` | `robot_eef:left`, `robot_eef:right`, `object:<id>` |
-| CLEARANCE | `safe_height_m`, `scale_m > 0` | `object:<id>` only |
-| ORIENTATION | unit `local_axis[3]`, unit `target_axis[3]`, `0 <= tolerance_rad < pi`, `scale_rad > 0` | EEF or object |
+| `axis_position_interval` | `a · (p-o)` | metres |
+| `radial_distance_interval` | `norm((I-aaᵀ)(p-o))` | metres |
+| `point_distance_interval` | `norm(p-o)` | metres |
+| `axis_angle_interval` | `atan2(norm((R b) × a), (R b) · a)`; b is the EEF local axis | radians |
+| `axis_displacement_interval` | `a · (p_k-p_start)` | metres |
+| `angular_displacement_interval` | rotation angle of `R_startᵀ R_k` | radians |
+| `gripper_interval` | continuous opening g, 0 closed / 1 open | opening fraction |
 
-Object subjects additionally require `constraint.attachment`:
+For axial position, `dL/du = 2(u-h)/scale²` above h and
+`2(u-l)/scale²` below l; it is zero inside. Quartic changes the outside
+derivative magnitude to `4 |v|³ / scale⁴`. The position gradient follows the
+world axis a. No Euler component interval is used for orientations. Aligning
+one local axis leaves rotation around that axis free. Norm/angle constraints
+can have symmetric stationary points (zero distance with a positive lower bound,
+or exactly antipodal axes); the FM prior remains important.
 
-```json
-{
-  "arm": "left",
-  "position_m": [0, 0, -0.1],
-  "quaternion_wxyz": [1, 0, 0, 0],
-  "vertices_m": [[-0.02, -0.02, -0.05], [0.02, 0.02, 0.05]],
-  "verification_status": "accepted",
-  "report_id": "replace-with-rigid-grasp-verification-reference"
-}
+Constraints compose by conjunction. A cylinder is radial distance bounds plus
+an axial interval. Three axial intervals form a box, which is geometrically
+different. Use separate IDs and weights; there are no hidden semantic groups,
+category-to-loss switches or executable agent-authored losses.
+
+## Activation, masks and action decoding
+
+Indices are raw recorded observation frames `[start,end)`. A reader window at
+frame s contains measured proprio at s and predicted targets at s+1, s+2, … .
+
+- `interval`: evaluate valid future frames in the intersection with the chunk.
+- `endpoint`: evaluate exactly end-1, never clip it to the chunk's last frame.
+- `reference_event`: evaluate at the annotated frame, after checking the
+  specified increasing/decreasing gripper threshold crossing on the **reference**
+  frame pair. Generated gripper values cannot disable this constraint. Add a
+  separate gripper interval if opening itself must be supervised.
+- Displacement constraints need activation.start inside the chunk or at the
+  measured initial state. Missing starts, event pairs, endpoints or required
+  dimensions mask the corresponding constraint.
+
+`training.constraints.execution_horizon=null` uses the complete predicted
+chunk. Set a positive integer for an executed-prefix ablation. No claim is made
+that the full predicted tail is actually executed by a receding-horizon policy.
+
+The current official RoboTwin EEF reader reads **absolute** world targets, not
+deltas. Decoding reverses its exact 80D scatter (when used) and affine
+normalization. Source quaternion order is stored in the episode action contract.
+Native RoboTwin emits WXYZ but the current OpenWAM reader converts it as XYZW;
+the loss decoder reverses that permutation in rotation-matrix space. The
+checkpoint representation and deployment conversions are unchanged.
+
+The reusable `action_trajectory.py` helper also distinguishes step increments
+from chunk-start offsets, and world/body translation and rotation composition.
+It is not silently enabled on the absolute RoboTwin reader. A different dataset
+must supply its own verified inverse normalization and initial-state adapter.
+Joint actions are rejected until an actual differentiable FK adapter exists.
+No physical time rate is inferred from variable-duration native commands.
+
+For flow matching, with `a_sigma=(1-sigma)*a+sigma*noise` and velocity
+`v=noise-a`, constraints act on `a_hat=a_sigma-sigma*v_pred`. The callback runs
+after model forward, in float32, retaining gradients to the action head. It
+does not evaluate physical geometry directly on noise or velocity predictions.
+
+## Embedded data contract
+
+The complete JSON payload contains `schema_version`, `action_contract`,
+`provenance`, and a `constraints` list. Each base constraint contains:
+
+```
+id, type, subject,
+reference_frame: {origin_m, quaternion_wxyz},
+parameters: {bounds, ...axes required by the type},
+activation: {mode, start, end, event?},
+penalty: {kind, scale, weight},
+evidence: {source, status, report_id, rationale}
 ```
 
-This too is a schema example. Supply the full relevant object geometry in its
-local frame, not just these illustrative points. The attachment pose maps the
-object frame into the EEF frame. Its quaternion is **wxyz**; RoboTwin HDF5
-EEF quaternions use **xyzw** and the reader converts them into rotation-6D
-columns. All labels are training-only metadata and never enter policy inputs.
+The standard-library schema is `openwam/train/constraint_schema.py`; RAX ships
+a byte-identical copy so its recording environment does not depend on OpenWAM
+or Torch. `subject` is left_eef or right_eef. Reference transforms are fixed
+within their annotated intervals. Units are metres/radians/open fraction;
+axes and quaternions must be unit length. Bounds must have a justified source,
+not be inferred from one successful action trajectory as guaranteed geometry.
+Known geometry can be annotated offline; it is not queried during training.
 
-## GPU-server launch
+RAX's `geometric-constraints` skill supplies a full JSON template and upsert
+procedure. Accepted annotations enter the loss. Proposed, unknown and rejected
+annotations remain in the data but contribute no loss. Observation-only EEF
+constraints do not establish grasp stability, contact force or object support.
 
-Use the author's existing training environment and a local copy of the
-`OpenWAM-Alpha-Sim-RoboTwin-Clean2Random` checkpoint for a rapid warm-start
-experiment. This does not repeat foundation pretraining or clean fine-tuning.
-Do not substitute the Full checkpoint: it includes randomized training data.
+The recorder stores native EEF observations, joint states, camera JPEGs,
+instruction, annotations and revision history in the same file. Its current
+sampling is native command boundaries with variable physical duration, recorded
+explicitly in provenance. Successful completed episodes are published to data/;
+failed recordings go to rejected/. Incomplete or invalid annotations prevent
+publication. This recording mode has not yet been validated for full benchmark
+data collection; it is not identical to the native expert's dense sample cadence.
 
-First run the integration tests in that environment (no weights needed):
+## Training and validation
+
+The feature is disabled by default. Once actual clean episodes contain accepted
+constraints, add these options to the existing training command:
 
 ```bash
-python -m pytest tests/test_constraint_supervision.py tests/test_flow_match_loss.py tests/test_openwam_trainer.py -q
+dataloader=robotwin dataloader.variant=clean_50 dataloader.action_mode=eef \
+training.constraints.weight=0.1
 ```
 
-After preparing real, verified labels, run a 20-step smoke test. The paths below
-are placeholders for files already on the server. Batch size 1 is a conservative
-smoke-test setting, not a measured H200 throughput choice.
+The numerical weight is an initial experiment setting, not a tuned result.
+Use the same checkpoint, clean data, seeds and schedule for an FM-only control.
+The objective archives embedded annotations and inverse-map hashes with the
+run; resume rejects changes to them, their weights or the execution horizon.
+Independent RoboTwin evaluation is still required to measure task success.
+
+Tests need no model weights or simulation:
 
 ```bash
-NPROC_PER_NODE=8 bash scripts/train.sh \
-  dataloader=robotwin \
-  dataloader.dataset_dir=/data/robotwin \
-  dataloader.variant=clean_50 \
-  dataloader.split=train \
-  dataloader.action_mode=eef \
-  model.architecture.variant=joint_self_attn \
-  training.finetune_ckpt_path=/models/OpenWAM-Alpha-Sim-RoboTwin-Clean2Random \
-  training.constraints.manifest=/data/labels/verified_constraints.jsonl \
-  training.constraints.weight=0.1 \
-  training.batch_size=1 \
-  training.debug=true \
-  training.output_path=outputs/c2r_constraints_smoke
+python -m pytest tests/test_constraint_supervision.py \
+  tests/test_embedded_constraint_dataset.py tests/test_robotwin_dataloader.py \
+  tests/test_flow_match_loss.py tests/test_openwam_trainer.py -q
 ```
 
-The weight `0.1` is an initial diagnostic setting, not a tuned recommendation.
-Run the matched continued-FM control from the **same checkpoint**, seed, data,
-batching and schedule with `training.constraints.weight=0`. Also retain the
-untouched checkpoint's evaluation as a reference. A short smoke run checks
-execution and gradient health; it is not evidence of improved benchmark scores.
-
-Each constraint run archives the exact manifest, its SHA-256, source/status
-counts, matched count, weight and gradient-entry convention. Resume refuses
-changes to this objective; use a new fine-tuning run for a changed ablation.
-Metrics include physical residual means/maxima and violation rates for each
-observed type. Unobserved types report a count of zero and omit residual/rate
-metrics; an absent label is not a satisfied constraint.
-
-## Evaluation
-
-Use the existing [RoboTwin deployment/evaluation workflow](../../benchmarks/robotwin/README.md).
-Serve each resulting checkpoint separately. For a selected-task randomized
-smoke test, with the policy server already running:
-
-```bash
-ROBOTWIN_PATH=/opt/RoboTwin \
-ROBOTWIN_PYTHON=/opt/conda/envs/robotwin/bin/python \
-ROBOTWIN_TEST_NUM=5 \
-bash benchmarks/robotwin/multi_eval.sh \
-  -m demo_randomized -n constraint_smoke \
-  -d /path/to/resulting/checkpoint adjust_bottle
-```
-
-Evaluate control and constraint checkpoints with identical tasks, seeds,
-episode counts and deployment settings. The full randomized C2R evaluation
-uses `all` tasks and 100 episodes/task; also check clean performance for
-regressions. Do not use held-out randomized evaluation episodes to construct
-training constraints or tune labels.
-
-RAX remains an optional later data/program generation source. This first stage
-does not include automatic simulator annotation extraction, an agent verifier,
-an E1/E2 sparse-action ablation, or a policy-feedback collection loop.
+The cross-repository test expects the RAX fork beside OpenWAM. Run these tests
+on the existing H200 environment; local development needs only light checks.
