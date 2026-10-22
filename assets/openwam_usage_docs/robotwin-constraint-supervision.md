@@ -132,12 +132,14 @@ annotations remain in the data but contribute no loss. Observation-only EEF
 constraints do not establish grasp stability, contact force or object support.
 
 The recorder stores native EEF observations, joint states, camera JPEGs,
-instruction, annotations and revision history in the same file. Its current
-sampling is native command boundaries with variable physical duration, recorded
-explicitly in provenance. Successful completed episodes are published to data/;
-failed recordings go to rejected/. Incomplete or invalid annotations prevent
-publication. This recording mode has not yet been validated for full benchmark
-data collection; it is not identical to the native expert's dense sample cadence.
+instruction, annotations and revision history in the same file. The current
+clean50 collection uses the native expert's plan/replay and
+`merge_pkl_to_hdf5_video` pipeline, retaining `save_freq` in provenance.
+Earlier interactive RAX recordings used native command boundaries; inspect
+`recording_method` and sampling metadata before mixing the two sources.
+Successful expert recordings enter `raw/` and are published to `data/` after
+constraint annotation and validation. Rejected seeds are logged separately;
+they never count towards the fifty successful, distinct scenes per task.
 
 ## Training and validation
 
@@ -154,6 +156,20 @@ Use the same checkpoint, clean data, seeds and schedule for an FM-only control.
 The objective archives embedded annotations and inverse-map hashes with the
 run; resume rejects changes to them, their weights or the execution horizon.
 Independent RoboTwin evaluation is still required to measure task success.
+
+Before a paired run, freeze the selected episodes, annotation revisions and
+normalization statistics for both arms of the comparison. The live collection
+directory is still growing; it is not itself a frozen experimental split.
+The generic configuration has placeholder data/model paths and a zero constraint
+weight, so it is not a fully configured experiment launch command.
+
+Validation status on 2026-10-22: the five test modules below pass 80 tests on the
+H200 host's CPU test environment. This includes FM callback gradients, but uses
+small/fake model components rather than the experiment checkpoint. A separate
+real-episode check passed full-coverage reader initialization, zero reference
+losses, and nonzero finite gradients for a deliberately reversed movement.
+Actual-checkpoint optimizer steps, checkpoint save/resume, 8-GPU training and
+post-training C2R success evaluation remain to be validated.
 
 Tests need no model weights or simulation:
 
