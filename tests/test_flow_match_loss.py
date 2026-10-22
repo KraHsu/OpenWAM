@@ -96,3 +96,61 @@ def test_action_loss_per_token_timestep_with_pad():
     inputs = {"action_is_pad": action_is_pad}
     with pytest.raises(ValueError, match="per-sample"):
         arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), inputs=inputs, device="cpu")
+
+
+def test_constraint_callback_preserves_fm_terms_and_backpropagates():
+    """Requires the normal OpenWAM CPU test environment, but no model weights."""
+    from tests.test_openwam_trainer import _make_fake_loss_inputs
+
+    arch = _make_arch()
+    arch.action_backbone.scheduler = _MockScheduler()
+    actions = torch.randn(1, 5, 7)
+    inputs = _make_fake_loss_inputs()
+    torch.manual_seed(17)
+    baseline = arch.compute_loss(actions=actions, **inputs)
+    captured = {}
+
+    def callback(clean):
+        captured["clean"] = clean
+        clean.retain_grad()
+        loss = clean.square().mean()
+        captured["loss"] = loss
+        return {"loss": loss, "metrics": {"test_count": clean.new_tensor(1.0)}}
+
+    torch.manual_seed(17)
+    augmented = arch.compute_loss(actions=actions, action_loss_callback=callback, **inputs)
+    torch.testing.assert_close(augmented["loss_video"], baseline["loss_video"], rtol=0, atol=0)
+    torch.testing.assert_close(augmented["loss_action"], baseline["loss_action"], rtol=0, atol=0)
+    torch.testing.assert_close(augmented["loss"], baseline["loss"] + captured["loss"])
+    captured["loss"].backward()
+    assert captured["clean"].grad.abs().sum() > 0
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in arch.action_backbone.parameters())
+
+
+def test_constraint_callback_clean_estimate_has_correct_flow_sign(monkeypatch):
+    from tests.test_openwam_trainer import _make_fake_loss_inputs
+
+    arch = _make_arch()
+    scheduler = _MockScheduler()
+    scheduler.sigmas = torch.full((1000,), 0.5)
+    arch.action_backbone.scheduler = scheduler
+    actions = torch.randn(1, 5, 7)
+    delta = torch.full_like(actions, 0.2, requires_grad=True)
+
+    def forward(noisy, action_timestep, **kwargs):
+        velocity = (noisy - actions) / 0.5 + delta
+        return torch.zeros_like(kwargs["latents"]), velocity
+
+    monkeypatch.setattr(arch, "forward", forward)
+    captured = {}
+
+    def callback(clean):
+        captured["clean"] = clean
+        return {"loss": clean.sum()}
+
+    result = arch.compute_loss(actions=actions, action_loss_callback=callback, **_make_fake_loss_inputs())
+    torch.testing.assert_close(captured["clean"], actions - 0.5 * delta)
+    # The constraint gradient must reach the velocity prediction with -sigma.
+    captured["clean"].sum().backward()
+    torch.testing.assert_close(delta.grad, torch.full_like(delta, -0.5))
+    assert torch.isfinite(result["loss"])

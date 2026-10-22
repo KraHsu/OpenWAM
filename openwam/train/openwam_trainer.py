@@ -166,6 +166,17 @@ class OpenWAMTrainer:
             min_timestep_boundary=float(t.min_timestep_boundary),
         )
 
+        from openwam.train.constraint_supervision import build_constraint_objective
+
+        self.constraint_objective = build_constraint_objective(cfg, dataset)
+        if self.constraint_objective is not None:
+            logger.info(
+                "Constraint supervision: manifest=%s sha256=%s matched=%d weight=%g",
+                self.constraint_objective.store.path,
+                self.constraint_objective.store.sha256,
+                self.constraint_objective.matched_constraints,
+                self.constraint_objective.weight,
+            )
         self.model = self  # self-reference some external callers expect
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
@@ -458,6 +469,9 @@ class OpenWAMTrainer:
         if resume_state_dir is not None:
             output_path = os.path.dirname(resume_state_dir)
             logger.info("[resume] reusing run dir %s (state=%s)", output_path, os.path.basename(resume_state_dir))
+            from openwam.train.constraint_supervision import validate_constraint_resume
+
+            validate_constraint_resume(output_path, getattr(self, "constraint_objective", None))
             # Keep the checkpoint-dir deploy artifact; refuse resume when it
             # diverges from the dataset transform (legacy or regenerated stats).
             if self.dataset is not None:
@@ -482,6 +496,9 @@ class OpenWAMTrainer:
 
                 copy_ckpt_artifacts(self._ckpt_source_dir, output_path)
             save_config(output_path, self.cfg)
+            objective = getattr(self, "constraint_objective", None)
+            if objective is not None:
+                objective.save_provenance(output_path)
             if self.dataset is not None:
                 save_normalization_stats(output_path, self.dataset)
         else:
@@ -561,17 +578,24 @@ class OpenWAMTrainer:
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
 
+        objective = getattr(self, "constraint_objective", None)
+        if objective is not None:
+            inputs["action_loss_callback"] = objective.bind(batch)
         result = self.architecture.compute_loss(
             **inputs,
             lambda_video=self.lambda_video,
             lambda_action=self.lambda_action,
         )
 
-        return {
+        losses = {
             "total": result["loss"],
             "video": result.get("loss_video", torch.tensor(0.0)),
             "action": result.get("loss_action", torch.tensor(0.0)),
         }
+        if objective is not None:
+            losses["constraint"] = result["loss_constraint"]
+            losses["constraint_metrics"] = result["constraint_metrics"]
+        return losses
 
     # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.
     def log_step(
@@ -591,6 +615,8 @@ class OpenWAMTrainer:
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
         labels = [("action", "loss_action")]
+        if "loss_constraint" in metrics:
+            labels.append(("constraint", "loss_constraint"))
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
@@ -616,6 +642,8 @@ class OpenWAMTrainer:
             }
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
+            for name, value in metrics.get("constraint_metrics", {}).items():
+                log_dict[f"constraints/{name}"] = value
             wandb_run.log(log_dict, step=global_step)
 
         if not debug:

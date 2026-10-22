@@ -1047,6 +1047,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         actions: Optional[torch.Tensor] = None,
         lambda_video: float = 1.0,
         lambda_action: float = 1.0,
+        action_loss_callback=None,
         **inputs,
     ) -> dict:
         """Compute joint video-action flow matching loss.
@@ -1066,6 +1067,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 be passed via ``inputs["actions"]``.
             lambda_video: Weight for video loss term.
             lambda_action: Weight for action loss term.
+            action_loss_callback: Optional training-only callable receiving a
+                differentiable clean-action estimate and returning loss/metrics.
             **inputs: Preprocessed video/text tensors plus forward-time flags.
 
         Returns:
@@ -1082,6 +1085,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             inputs.pop("actions", None)
 
         max_tb = int(inputs.pop("max_timestep_boundary", 1) * len(vb.scheduler.timesteps))
+        if action_loss_callback is not None and (lambda_action <= 0 or actions is None):
+            raise ValueError("action_loss_callback requires actions and a positive action loss weight")
         min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
         B = inputs["input_latents"].shape[0]
 
@@ -1165,6 +1170,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             _device,
         )
 
+        if action_loss_callback is not None and action_noise_pred is None:
+            raise ValueError("action_loss_callback requires an action prediction")
         if lambda_action == 0 or action_noise_pred is None:
             return {
                 "loss": lambda_video * loss_video,
@@ -1192,6 +1199,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "loss_video": lambda_video * loss_video.detach(),
             "loss_action": lambda_action * loss_action.detach(),
         }
+
+        if action_loss_callback is not None:
+            # The scheduler predicts noise - data, with sigma=0 at clean data.
+            # Keep the clean estimate in float32 and connected to prediction.
+            clean_actions = action_scheduler.flow_step(
+                action_noise_pred.float(), a_sigma_bc.float(), 0.0, noisy_actions.float()
+            )
+            auxiliary = action_loss_callback(clean_actions)
+            result["loss"] = result["loss"] + auxiliary["loss"]
+            result["loss_constraint"] = auxiliary["loss"].detach()
+            result["constraint_metrics"] = auxiliary.get("metrics", {})
 
         return result
 

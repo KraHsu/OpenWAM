@@ -121,6 +121,12 @@ def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
     def _f(v):
         return v.item() if isinstance(v, torch.Tensor) else float(v)
 
+    extras = {}
+    if "constraint" in losses:
+        from openwam.train.constraint_supervision import reduce_constraint_metrics
+
+        extras = reduce_constraint_metrics(accelerator, losses)
+
     if accelerator is not None and accelerator.num_processes > 1:
         local = torch.tensor(
             [
@@ -138,12 +144,14 @@ def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
             "loss_video": g[1].item(),
             "loss_action": g[2].item(),
             "grad_norm": g[3].item(),
+            **extras,
         }
     return {
         "loss_total": loss.detach().item(),
         "loss_video": _f(losses["video"]),
         "loss_action": _f(losses["action"]),
         "grad_norm": grad_norm.item(),
+        **extras,
     }
 
 
