@@ -1,4 +1,5 @@
 """Composable physical constraints; independent of operation names and data layout."""
+import math
 import torch
 
 from openwam.train.action_trajectory import physical_rotation
@@ -50,6 +51,9 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     else:
         dims = slice(offset, offset+3)
     active &= valid[:, dims].all(-1)
+    if kind == 'motion_direction_cone':
+        previous_valid = torch.cat((valid.new_zeros(1), valid[:-1, dims].all(-1)))
+        active &= previous_valid
     if not active.any():
         return None
     initial = None
@@ -65,7 +69,15 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
         raise ValueError('Non-finite predicted value in an active constraint')
     frame = c['reference_frame']
     basis = frame_rotation(frame['quaternion_wxyz'], values)
-    if kind == 'gripper_interval':
+    if kind == 'motion_direction_cone':
+        indices = torch.nonzero(active, as_tuple=False).flatten()
+        step = values-pred[indices-1, dims]
+        if not torch.isfinite(step).all(): raise ValueError('Non-finite previous position in direction constraint')
+        axis = basis @ values.new_tensor(p['axis'])
+        axial = (step*axis).sum(-1)
+        lateral = torch.linalg.vector_norm(step-axial[:, None]*axis, dim=-1)
+        scalar = torch.maximum(lateral-math.tan(p['half_angle_rad'])*axial, -axial).clamp_min(0)
+    elif kind == 'gripper_interval':
         scalar = values[:, 0]
     elif kind == 'axis_angle_interval':
         rotation = physical_rotation(values, rotation_convention)

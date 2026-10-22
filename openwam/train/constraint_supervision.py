@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from openwam.train.constraint_schema import canonical_json, number, validate_bundle
+from openwam.train.constraint_coverage import chunk_candidate, coverage_report
 from openwam.train.meta_constraints import residual, penalty
 
 @dataclass
@@ -55,11 +56,13 @@ class ActionDecoder:
 
 
 class RoboTwinConstraintObjective:
-    def __init__(self, dataset, dataset_root, *, weight, execution_horizon=None):
+    def __init__(self, dataset, dataset_root, *, weight, execution_horizon=None, require_full_coverage=True):
         self.weight = number(weight, positive=True)
         if execution_horizon is not None and (type(execution_horizon) is not int or execution_horizon < 1):
             raise ValueError('execution_horizon must be null or a positive integer')
         self.execution_horizon = execution_horizon
+        self.require_full_coverage = require_full_coverage
+        self.coverage = {}
         self.episodes, archived = {}, []
         status_counts, source_counts = Counter(), Counter()
         root = Path(dataset_root).resolve()
@@ -83,6 +86,10 @@ class RoboTwinConstraintObjective:
                         if c['evidence']['status'] == 'accepted':
                             constraints.append(c)
                     archived.append({'episode': path.relative_to(root).as_posix(), 'bundle': bundle})
+                report = coverage_report(constraints, length)
+                self.coverage[str(path)] = report
+                if require_full_coverage and not report['complete']:
+                    raise ValueError(f'Incomplete chunk-safe motion coverage: {path}; {report["covered"]}/{report["total"]} frames')
                 self.episodes[str(path)] = (decoder, constraints, convention, digest)
         self.matched_constraints = sum(len(entry[1]) for entry in self.episodes.values())
         if not self.matched_constraints:
@@ -97,7 +104,9 @@ class RoboTwinConstraintObjective:
                                        sort_keys=True) for d, _, _, _ in self.episodes.values()})
         return {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
                 'matched_constraints': self.matched_constraints, 'status_counts': dict(self.store.status_counts),
-                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v1',
+                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v2_full_motion',
+                'require_full_coverage': self.require_full_coverage,
+                'fully_covered_episodes': sum(r['complete'] for r in self.coverage.values()),
                 'execution_horizon': self.execution_horizon, 'gradient_entry': 'single_step_clean_action_estimate',
                 'decoder_sha256': hashlib.sha256(json.dumps(decoders).encode()).hexdigest()}
 
@@ -121,7 +130,9 @@ class RoboTwinConstraintObjective:
             digest = hashlib.sha256(canonical_json(bundle).encode()).hexdigest() if bundle is not None else None
             if digest != entry[3]:
                 raise ValueError('Embedded constraints changed or disappeared after dataset initialization')
-            entries.append((*entry, sample))
+            horizon = min(self.execution_horizon or len(sample['action']), len(sample['action']))
+            candidates = [c for c in entry[1] if chunk_candidate(c, int(sample['start_frame']), horizon)]
+            entries.append((entry[0], candidates, entry[2], entry[3], sample))
 
         def evaluate(clean_actions):
             if clean_actions.ndim != 3 or clean_actions.shape[0] != len(entries):
@@ -184,7 +195,8 @@ def build_constraint_objective(cfg, dataset):
     if settings.get('manifest'):
         raise ValueError('External manifests are obsolete; embed constraints in each HDF5 episode')
     return RoboTwinConstraintObjective(dataset, cfg.dataloader.dataset_dir, weight=weight,
-                                       execution_horizon=settings.get('execution_horizon'))
+                                       execution_horizon=settings.get('execution_horizon'),
+                                       require_full_coverage=settings.get('require_full_coverage', True))
 
 
 def validate_constraint_resume(output_path, objective):

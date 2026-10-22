@@ -68,6 +68,23 @@ frame s contains measured proprio at s and predicted targets at s+1, s+2, … .
 chunk. Set a positive integer for an executed-prefix ablation. No claim is made
 that the full predicted tail is actually executed by a receding-horizon policy.
 
+`training.constraints.require_full_coverage=true` (default) requires a
+chunk-safe position/motion constraint for every action frame of both arms.
+Gripper-only intervals and displacements requiring distant anchors do not count.
+Orientation and gripper freedoms remain task-specific. Use `false` only for an
+explicit sparse ablation, not the full-coverage experiment.
+
+Schema 1.1 adds `motion_direction_cone`: for adjacent decoded positions, let
+`v=p[t]-p[t-1]`, `a=dot(n,v)`, and `b=norm(v-a*n)`. Its feature is
+`max(0,b-tan(half_angle_rad)*a,-a)`; a squared hinge penalizes values above the
+annotated slack. A broad 60-degree cone allows different paths and step lengths,
+with no absolute per-frame position targets. Reference turns/stops split the
+direction intervals. The first predicted step uses the measured initial state,
+so short chunks need no distant anchor. Zero motion is allowed: task arrival
+still relies on interaction/endpoint constraints and the base loss. Direction
+slack, cone width, and stationary hold margins are declared priors, not physical
+success guarantees. Schema 1.0 remains readable for legacy data.
+
 The current official RoboTwin EEF reader reads **absolute** world targets, not
 deltas. Decoding reverses its exact 80D scatter (when used) and affine
 normalization. Source quaternion order is stored in the episode action contract.

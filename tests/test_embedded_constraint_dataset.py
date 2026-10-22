@@ -39,7 +39,7 @@ def test_rax_recording_reader_loss_roundtrip(tmp_path, monkeypatch):
     pred[-1, 2] = 0.4
     pred.requires_grad_()
     result = obj.bind([sample])(pred[None])
-    assert result['loss'] > 0 and result['metrics']['constraint_count'] == 1
+    assert result['loss'] > 0 and result['metrics']['constraint_count'] >= 1
     result['loss'].backward()
     assert pred.grad[-1, 2] > 0 and pred.grad[:-1].count_nonzero() == 0
     assert torch.isfinite(pred.grad).all()

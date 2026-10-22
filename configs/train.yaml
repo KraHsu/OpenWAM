@@ -46,6 +46,7 @@ training:
   constraints:
     weight: 0.0
     execution_horizon: null      # null: full chunk; integer: supervise executed prefix only
+    require_full_coverage: true  # Every arm/action frame needs chunk-safe position/motion supervision.
 
   # --- Flow matching timestep range ---
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)

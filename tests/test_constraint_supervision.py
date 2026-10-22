@@ -57,6 +57,7 @@ def objective(tmp_path, cs, **kwargs):
     reader = SimpleNamespace(action_mode='eef', normalize_mode=None, _normalizer=None, _unify_dst_index=None,
                              variant='clean_50', split='train', _episode_files=[episode], _episode_lengths=[10],
                              _constraint_bundles={episode: b})
+    kwargs.setdefault('require_full_coverage', False)  # Deliberately sparse primitive unit fixtures.
     obj = RoboTwinConstraintObjective(reader, tmp_path, weight=0.5, **kwargs)
     ref = actions()
     sample = {'episode_path': episode, 'start_frame': 0, 'proprio': ref[:1], 'action': ref[1:],
