@@ -20,7 +20,8 @@ def chunk_candidate(c, start, horizon):
     """Fast reference-only prefilter; residual() still checks dimension masks."""
     lo, hi = active_range(c)
     if hi <= start+1 or lo > start+horizon: return False
-    if c['type'] in ('axis_displacement_interval', 'angular_displacement_interval'):
+    if (c['type'] in ('axis_displacement_interval', 'angular_displacement_interval')
+            and c['parameters'].get('anchor', 'predicted_start') == 'predicted_start'):
         if not start <= c['activation']['start'] <= start+horizon: return False
     return True
 
@@ -31,9 +32,10 @@ def coverage_masks(constraints, length):
     for c in constraints:
         if c['evidence']['status'] != 'accepted': continue
         kind = c['type']; bounds = c['parameters']['bounds']
-        # Displacements require an old origin and cannot guarantee short-chunk coverage.
-        if kind in POSITION: group = 'position_or_motion'
-        elif kind == 'axis_angle_interval' and bounds != [0, math.pi]: group = 'orientation'
+        # Predicted-start displacement origins may be outside a short chunk.
+        fixed = c['parameters'].get('anchor') == 'reference_frame'
+        if kind in POSITION or (kind == 'axis_displacement_interval' and fixed): group = 'position_or_motion'
+        elif (kind == 'axis_angle_interval' or (kind == 'angular_displacement_interval' and fixed)) and bounds != [0, math.pi]: group = 'orientation'
         elif kind == 'gripper_interval' and bounds != [0, 1]: group = 'gripper'
         else: continue
         lo, hi = active_range(c)

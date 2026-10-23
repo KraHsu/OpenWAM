@@ -57,7 +57,8 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     if not active.any():
         return None
     initial = None
-    if kind in ('axis_displacement_interval', 'angular_displacement_interval'):
+    if (kind in ('axis_displacement_interval', 'angular_displacement_interval')
+            and p.get('anchor', 'predicted_start') == 'predicted_start'):
         i = a['start']-start_frame
         if i < 0 or i >= len(pred) or not valid[i, dims].all():
             return None
@@ -86,7 +87,7 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
         scalar = torch.atan2(torch.linalg.vector_norm(torch.linalg.cross(axis, target), dim=-1), (axis*target).sum(-1))
     elif kind == 'angular_displacement_interval':
         rotation = physical_rotation(values, rotation_convention)
-        origin = physical_rotation(initial, rotation_convention)
+        origin = basis if initial is None else physical_rotation(initial, rotation_convention)
         scalar = rotation_angle(origin.transpose(-1, -2) @ rotation)
     else:
         delta = values - (initial if initial is not None else values.new_tensor(frame['origin_m']))

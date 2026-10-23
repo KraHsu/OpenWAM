@@ -76,14 +76,16 @@ def test_resume_position_grad_accum_1_is_identity():
     assert compute_resume_position(25, 10, 1) == (2, 5, 25)
 
 
-def test_resume_position_floors_skip_and_pulls_back_global_step():
-    # gs=10, bpe=100, grad_accum=4: skip 10 -> 8, aligned 10 -> 8 (no re-train, step matched).
-    assert compute_resume_position(10, 100, 4) == (0, 8, 8)
+def test_resume_position_rejects_lost_accumulated_gradients():
+    with pytest.raises(ValueError, match='inside gradient accumulation'):
+        compute_resume_position(10, 100, 4)
 
 
 def test_resume_position_alignment_across_epoch():
-    # gs=16, bpe=10, grad_accum=4: start=1, skip 6 -> 4, aligned = 1*10 + 4 = 14.
-    assert compute_resume_position(16, 10, 4) == (1, 4, 14)
+    with pytest.raises(ValueError, match='inside gradient accumulation'):
+        compute_resume_position(16, 10, 4)
+    assert compute_resume_position(14, 10, 4) == (1, 4, 14)
+    assert compute_resume_position(20, 10, 4) == (2, 0, 20)
 
 
 def test_resume_position_already_aligned_unchanged():

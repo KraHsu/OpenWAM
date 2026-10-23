@@ -81,6 +81,29 @@ def test_axial_interval_zero_inside_and_continuous_growing_penalty():
     assert torch.autograd.grad(quartic, large)[0] > 0
 
 
+@pytest.mark.parametrize('kind', ['axis_displacement_interval', 'angular_displacement_interval'])
+def test_fixed_reference_anchor_works_when_original_frame_is_outside_chunk(kind):
+    from openwam.train.constraint_coverage import chunk_candidate
+    c = constraint(kind, start=0, end=101)
+    c['parameters']['anchor'] = 'reference_frame'
+    c['parameters']['bounds'] = [0., .1]
+    x = actions(2)
+    if kind == 'axis_displacement_interval':
+        c['reference_frame']['origin_m'] = [0., 0., 2.]
+        x[:, 2] = 2.
+        x[-1, 2] = 2.3
+    else:
+        angle = .3
+        x[-1, 3:9] = torch.tensor([math.cos(angle), math.sin(angle), 0., -math.sin(angle), math.cos(angle), 0.])
+    x.requires_grad_()
+    assert chunk_candidate(c, 99, 1)
+    v = evaluate(x, c, start=99)
+    torch.testing.assert_close(v, torch.tensor([.2]))
+    penalty(v, c['penalty']).backward()
+    assert torch.isfinite(x.grad).all() and x.grad[-1].abs().sum() > 0
+    assert x.grad[0].count_nonzero() == 0
+
+
 def test_fixed_task_frame_rotation_and_translation():
     c = constraint(); c['parameters'].update(axis=[1, 0, 0], bounds=[0.9, 1.1])
     c['reference_frame'] = {'origin_m': [2, 3, 0], 'quaternion_wxyz': [math.sqrt(0.5), 0, 0, math.sqrt(0.5)]}

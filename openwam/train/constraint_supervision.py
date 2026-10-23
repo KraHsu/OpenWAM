@@ -104,7 +104,7 @@ class RoboTwinConstraintObjective:
                                        sort_keys=True) for d, _, _, _ in self.episodes.values()})
         return {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
                 'matched_constraints': self.matched_constraints, 'status_counts': dict(self.store.status_counts),
-                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v2_full_motion',
+                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v3_reference_anchor',
                 'require_full_coverage': self.require_full_coverage,
                 'fully_covered_episodes': sum(r['complete'] for r in self.coverage.values()),
                 'execution_horizon': self.execution_horizon, 'gradient_entry': 'single_step_clean_action_estimate',

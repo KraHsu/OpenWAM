@@ -1,0 +1,14 @@
+{
+  "dataset_root": "/path/to/robotwin_clean50_v1",
+  "rax_root": "/path/to/rax",
+  "openwam_root": "/path/to/OpenWAM",
+  "run_root": "/path/to/experiments/c2r_meta_e5_bs256",
+  "python": "/path/to/training/python",
+  "initial_checkpoint": null,
+  "num_epochs": 5,
+  "global_batch": 256,
+  "micro_batch": 2,
+  "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+  "learning_rate": 0.0001,
+  "constraint_weight": 0.1
+}

@@ -318,20 +318,18 @@ def find_latest_accel_state(run_dir: str) -> str | None:
 
 
 def compute_resume_position(global_step: int, batches_per_epoch: int, grad_accum: int) -> tuple[int, int, int]:
-    """Map a resumed ``global_step`` to ``(start_epoch, skip_first_batches, aligned_global_step)``.
+    """Resume exactly at an update boundary, never rewind a saved optimizer.
 
-    ``skip`` is floored to a grad_accum boundary so the first optimizer step after
-    resume sees a full accumulation cycle; ``aligned_global_step`` pulls ``global_step``
-    back to that same boundary so the floored-off batches are not re-trained and the
-    per-step seed (keyed on global_step) stays matched. No-op at grad_accum=1.
+    A legacy mid-accumulation checkpoint has no saved accumulated gradients and
+    cannot resume faithfully. Warm-start its weights as a new run instead.
     """
-    batches_per_epoch = max(batches_per_epoch, 1)
+    if global_step < 0 or batches_per_epoch < 1 or grad_accum < 1:
+        raise ValueError('Invalid resume step/epoch/accumulation values')
     start_epoch = global_step // batches_per_epoch
     skip = global_step % batches_per_epoch
     if grad_accum > 1 and skip % grad_accum != 0:
-        skip = (skip // grad_accum) * grad_accum
-    aligned_global_step = start_epoch * batches_per_epoch + skip
-    return start_epoch, skip, aligned_global_step
+        raise ValueError('Checkpoint is inside gradient accumulation; use finetune_ckpt_path for a new run')
+    return start_epoch, skip, global_step
 
 
 # --- Retention / finalize (prune) ---

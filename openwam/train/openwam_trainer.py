@@ -277,6 +277,7 @@ class OpenWAMTrainer:
 
         opt_step = 0
         global_step = 0
+        last_save_bucket = 0
         start_epoch = 0
         skip_first = 0
 
@@ -285,6 +286,7 @@ class OpenWAMTrainer:
             global_step, opt_step, start_epoch, skip_first = self.resume_if_configured(
                 resume_state_dir, dataloader, grad_accum
             )
+            last_save_bucket = global_step // save_steps if save_steps else 0
             already_done = (num_epochs is not None and start_epoch >= num_epochs) or (
                 max_steps and global_step >= max_steps
             )
@@ -332,6 +334,8 @@ class OpenWAMTrainer:
                 with self.accelerator.accumulate(self.architecture):
                     losses = self.compute_loss(batch)
                     loss = losses["total"]
+                    if not torch.isfinite(loss.detach()).all():
+                        raise FloatingPointError('Non-finite training loss; refusing optimizer update')
                     self.accelerator.backward(loss)
 
                     grad_norm = torch.tensor(0.0, device=loss.device)
@@ -370,14 +374,18 @@ class OpenWAMTrainer:
 
                 # save_steps: write the weights line (+ the resumable full state when
                 # save_full_states_for_resume=true), then prune in lockstep.
-                if save_steps and global_step > 0 and global_step % save_steps == 0:
+                # A full state does not save partially accumulated gradients.
+                # Defer a due checkpoint until the next completed update.
+                if (save_steps and global_step // save_steps > last_save_bucket
+                        and self.accelerator.sync_gradients):
                     save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
                     if save_full_states_for_resume:
                         save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
                     if is_main:
                         manage_checkpoints(output_path, keep_last_k)
+                    last_save_bucket = global_step // save_steps
 
-                if max_steps and global_step >= max_steps:
+                if max_steps and global_step >= max_steps and self.accelerator.sync_gradients:
                     pbar.close()
                     self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                     return
@@ -553,11 +561,12 @@ class OpenWAMTrainer:
             logger.info("[resume] loading Accelerate state from %s", resume_state_dir)
         meta = load_full_state(self.accelerator, resume_state_dir)
         global_step = int(meta.get("global_step", 0))
-        # Align global_step to the grad_accum boundary skip was floored to, then derive
-        # opt_step from it — otherwise floored-off batches re-train and per-step seeds
-        # (keyed on global_step) drift. No-op at grad_accum=1.
+        # Never rewind the sample counter while keeping a later optimizer/RNG
+        # state. New checkpoints are saved only at completed update boundaries.
         start_epoch, skip, global_step = compute_resume_position(global_step, len(dataloader), grad_accum)
-        opt_step = global_step // grad_accum
+        # Each epoch can end in a partial accumulation cycle. Its update still
+        # counts; global_step // grad_accum loses those completed updates.
+        opt_step = int(meta.get('opt_step', start_epoch * math.ceil(len(dataloader)/grad_accum) + skip//grad_accum))
         if is_main:
             logger.info(
                 "[resume] resumed at global_step=%d opt_step=%d epoch=%d skip_first=%d",
@@ -620,6 +629,16 @@ class OpenWAMTrainer:
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
+        if not all(math.isfinite(float(metrics[key])) for key in
+                   ('loss_total', 'loss_video', 'loss_action', 'grad_norm')):
+            raise FloatingPointError('Non-finite training metrics')
+
+        if (cfg_get(self.cfg.training, 'metrics_jsonl', False) and output_path
+                and self.accelerator.is_main_process and self.accelerator.sync_gradients):
+            import json
+            with open(os.path.join(output_path, 'metrics.jsonl'), 'a') as stream:
+                stream.write(json.dumps(dict(metrics, step=global_step, opt_step=opt_step,
+                                             epoch=epoch, lr=lr), allow_nan=False)+'\n')
 
         if pbar is not None:
             postfix = {"loss": f"{loss_total:.4f}", "video": f"{loss_video:.4f}"}
@@ -697,6 +716,9 @@ class OpenWAMTrainer:
             save_weights(self.accelerator, self.architecture, output_path, global_step, final=True)
         self.accelerator.wait_for_everyone()
         if is_main:
-            finalize_keep_weights_only(output_path, keep_last_k)
+            if cfg_get(self.cfg.training, 'keep_resume_state_on_finish', False):
+                manage_checkpoints(output_path, keep_last_k)
+            else:
+                finalize_keep_weights_only(output_path, keep_last_k)
         if wandb_run is not None:
             wandb_run.finish()

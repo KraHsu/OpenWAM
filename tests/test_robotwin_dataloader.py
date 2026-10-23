@@ -1147,6 +1147,21 @@ def test_discover_robotwin_roots_loads_every_task_directory(tmp_path):
     assert [task for task, _ in roots] == ["custom_task", "task_a", "task_b"]
 
 
+def test_config_explicit_null_really_disables_normalization(tmp_path):
+    from openwam.dataloader.robotwin import MultiTaskRoboTwinDataset
+    from omegaconf import OmegaConf
+
+    data = tmp_path / 'task' / 'aloha-agilex_clean_50' / 'data'
+    data.mkdir(parents=True)
+    _create_mock_episode(str(data/'episode0.hdf5'))
+    config = OmegaConf.create({'dataset_dir': str(tmp_path), 'variant': 'clean_50',
+                              'normalize_mode': None, 'multiview': False,
+                              'num_frames': 5, 'video_stride': 1, 'height': 32, 'width': 32})
+    dataset = MultiTaskRoboTwinDataset.from_config(config)
+    assert dataset._sub_datasets[0]._normalizer is None
+    assert not (tmp_path/'meta/robotwin_clean_50_normalization_stats.npy').exists()
+
+
 def test_from_config_via_registry():
     """build_dataset dispatches to MultiTaskRoboTwinDataset.from_config."""
     from openwam.dataloader.registry import build_dataset

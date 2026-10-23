@@ -60,9 +60,20 @@ frame s contains measured proprio at s and predicted targets at s+1, s+2, … .
   specified increasing/decreasing gripper threshold crossing on the **reference**
   frame pair. Generated gripper values cannot disable this constraint. Add a
   separate gripper interval if opening itself must be supervised.
-- Displacement constraints need activation.start inside the chunk or at the
+- Displacement constraints with the default `parameters.anchor=predicted_start`
+  need activation.start inside the chunk or at the
   measured initial state. Missing starts, event pairs, endpoints or required
   dimensions mask the corresponding constraint.
+
+Schema 1.2 adds explicit `parameters.anchor=reference_frame` to displacement
+types. Axial displacement then uses `a · (p-o)`; angular displacement uses the
+rotation angle of `Qᵀ R`. These fixed measured anchors remain usable when the
+original demonstration frame is outside the action chunk. They do **not** claim
+to measure a change from an unobserved generated starting pose. Publication
+policy v2 converts spans longer than 32 actions to this representation, preserving
+the reference bounds and activation, and records the change in each rationale
+and the HDF5 revision history. The training gate rejects unreachable endpoint
+constraints instead of silently masking them throughout training.
 
 `training.constraints.execution_horizon=null` uses the complete predicted
 chunk. Set a positive integer for an executed-prefix ablation. No claim is made
@@ -163,13 +174,41 @@ directory is still growing; it is not itself a frozen experimental split.
 The generic configuration has placeholder data/model paths and a zero constraint
 weight, so it is not a fully configured experiment launch command.
 
-Validation status on 2026-10-22: the five test modules below pass 80 tests on the
-H200 host's CPU test environment. This includes FM callback gradients, but uses
-small/fake model components rather than the experiment checkpoint. A separate
-real-episode check passed full-coverage reader initialization, zero reference
-losses, and nonzero finite gradients for a deliberately reversed movement.
+Validation on 2026-10-22: 117 OpenWAM tests pass in the H200 training Python
+environment on CPU. Model-level unit tests use small/fake components. A separate
+audit of 2054 published episodes (409656 observation frames) passed full motion
+coverage, native/reference decoding consistency, distinct scenes, all camera
+JPEG decoding, and chunk observability checks. Actual reader tests used fresh
+min-max statistics and the 80D mapping: 576 chunks across 45 available tasks
+had exactly zero reference loss; all 45 tasks produced finite nonzero gradients
+under a physical position perturbation. This is a partial-collection snapshot;
+the unattended gate repeats the checks on the final 2500-episode snapshot.
 Actual-checkpoint optimizer steps, checkpoint save/resume, 8-GPU training and
 post-training C2R success evaluation remain to be validated.
+
+`scripts/robotwin_training_gate.py --plan <plan.json>` provides the unattended
+workflow; start from `configs/robotwin_clean50_gate.example.json`. It waits for
+all 50 tasks × 50 published episodes and completed annotations, requires an
+explicit compatible checkpoint, copies an independent dataset snapshot, audits
+all frames/JPEGs/labels and distinct initial scenes, and builds fresh clean-only
+normalization statistics. It then checks the actual normalized/unified reader,
+waits for free GPUs, and runs an 8-GPU optimizer/save/restart/resume smoke test.
+Only after those checks pass does it start a fresh 5-epoch run with effective
+global batch 256 (8 × microbatch 2 × accumulation 16 by default; the epoch tail
+can be a smaller batch). Smoke updates are discarded. A failure stops the gate
+with `state.json` and logs; it never retries a failed full training run implicitly.
+Checkpoint saves now wait for completed accumulation, and legacy checkpoints
+saved mid-accumulation are rejected on resume. Fixed reference anchors are a
+training observability repair, not additional physical-tolerance calibration.
+
+For the official `dual_system / joint_self_attn` foundation initialization, run
+`scripts/prepare_robotwin_initial_checkpoint.py --plan <plan.json> --model-root
+<server-model-directory>` on the training host. It resolves the current `main`
+of `OpenWAM/OpenWAM-Alpha-Pretrain-Foundation-Model` once, downloads that coherent
+revision, verifies file sizes and LFS SHA256 hashes, checks the 80D architecture
+and safetensors header, then atomically fills `initial_checkpoint` in the plan.
+The gate keeps waiting while the download is incomplete. Download status and
+the exact resolved revision are recorded in `checkpoint_download.json`.
 
 Tests need no model weights or simulation:
 

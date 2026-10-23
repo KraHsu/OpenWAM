@@ -926,7 +926,9 @@ class MultiTaskRoboTwinDataset(BaseDataset):
             _cam_layout = list(_cam_layout)
 
         # normalize_mode can be null/None to disable
-        _norm_mode = _get("normalize_mode", "min-max")
+        # Explicit YAML null disables normalization; _get treats null as a
+        # missing value and would silently turn min-max back on.
+        _norm_mode = config.get("normalize_mode", "min-max")
         if isinstance(_norm_mode, str) and _norm_mode.lower() in ("none", "null", ""):
             _norm_mode = None
 

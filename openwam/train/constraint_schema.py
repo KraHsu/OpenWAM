@@ -2,7 +2,7 @@
 import json
 import math
 
-SCHEMA_VERSION = '1.1'
+SCHEMA_VERSION = '1.2'
 HDF5_KEY = 'trajectory_constraints/json'
 KINDS = ('axis_position_interval', 'radial_distance_interval', 'point_distance_interval',
          'axis_angle_interval', 'axis_displacement_interval', 'angular_displacement_interval', 'gripper_interval',
@@ -48,7 +48,10 @@ def validate_constraint(c, length=None):
         required.update(('local_axis', 'reference_axis'))
     if kind == 'motion_direction_cone':
         required.update(('axis', 'half_angle_rad'))
-    keys(p, required)
+    displacement = kind in ('axis_displacement_interval', 'angular_displacement_interval')
+    keys(p, required, ('anchor',) if displacement else ())
+    if displacement and p.get('anchor', 'predicted_start') not in ('predicted_start', 'reference_frame'):
+        raise ValueError('Displacement anchor must be predicted_start or reference_frame')
     for key in ('axis', 'local_axis', 'reference_axis'):
         if key in p:
             vector(p[key], 3, unit=True)
@@ -104,7 +107,7 @@ def validate_constraint(c, length=None):
 
 def validate_bundle(bundle, length=None):
     keys(bundle, ('schema_version', 'action_contract', 'provenance', 'constraints'))
-    if bundle['schema_version'] not in ('1.0', SCHEMA_VERSION):
+    if bundle['schema_version'] not in ('1.0', '1.1', SCHEMA_VERSION):
         raise ValueError('Unsupported embedded constraint schema')
     contract = bundle['action_contract']
     keys(contract, ('position', 'rotation', 'quaternion_order', 'gripper', 'frame'))
@@ -126,6 +129,8 @@ def validate_bundle(bundle, length=None):
         raise ValueError('constraints must be a list of conjunctive base constraints')
     ids = set()
     for c in bundle['constraints']:
+        if 'anchor' in c['parameters'] and bundle['schema_version'] != SCHEMA_VERSION:
+            raise ValueError('Explicit displacement anchors require schema 1.2')
         if c['type'] == 'motion_direction_cone' and bundle['schema_version'] == '1.0':
             raise ValueError('Direction cones require schema 1.1')
         validate_constraint(c, length)
