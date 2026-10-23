@@ -183,8 +183,16 @@ min-max statistics and the 80D mapping: 576 chunks across 45 available tasks
 had exactly zero reference loss; all 45 tasks produced finite nonzero gradients
 under a physical position perturbation. This is a partial-collection snapshot;
 the unattended gate repeats the checks on the final 2500-episode snapshot.
-Actual-checkpoint optimizer steps, checkpoint save/resume, 8-GPU training and
-post-training C2R success evaluation remain to be validated.
+A real eight-H200 smoke test with the official Foundation checkpoint passed:
+microbatch 16 and accumulation 2 give global batch 256; one optimizer update
+was saved, a fresh process restored its full state, and a second update completed
+with finite losses/gradients and changed action-model weights. The recorded
+microstep/optimizer-step pairs were (2, 1) and (4, 2). This used the audited
+partial snapshot and a constant learning rate to exercise parameter updates;
+all 438 frozen T5/VAE tensors were exactly equal before and after restart.
+The formal run retains warmup/cosine. It is a chain validation, not evidence of
+convergence or task success. Full five-epoch training and post-training C2R
+evaluation remain to be completed.
 
 `scripts/robotwin_training_gate.py --plan <plan.json>` provides the unattended
 workflow; start from `configs/robotwin_clean50_gate.example.json`. It waits for
@@ -194,7 +202,7 @@ all frames/JPEGs/labels and distinct initial scenes, and builds fresh clean-only
 normalization statistics. It then checks the actual normalized/unified reader,
 waits for free GPUs, and runs an 8-GPU optimizer/save/restart/resume smoke test.
 Only after those checks pass does it start a fresh 5-epoch run with effective
-global batch 256 (8 × microbatch 2 × accumulation 16 by default; the epoch tail
+global batch 256 (8 × microbatch 16 × accumulation 2 in the example; the epoch tail
 can be a smaller batch). Smoke updates are discarded. A failure stops the gate
 with `state.json` and logs; it never retries a failed full training run implicitly.
 Checkpoint saves now wait for completed accumulation, and legacy checkpoints
