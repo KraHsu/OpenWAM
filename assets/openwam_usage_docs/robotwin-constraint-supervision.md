@@ -169,8 +169,8 @@ run; resume rejects changes to them, their weights or the execution horizon.
 Independent RoboTwin evaluation is still required to measure task success.
 
 Before a paired run, freeze the selected episodes, annotation revisions and
-normalization statistics for both arms of the comparison. The live collection
-directory is still growing; it is not itself a frozen experimental split.
+normalization statistics for both arms of the comparison. Use an independent
+snapshot so later changes to the collection directory cannot alter the run.
 The generic configuration has placeholder data/model paths and a zero constraint
 weight, so it is not a fully configured experiment launch command.
 
@@ -193,6 +193,21 @@ all 438 frozen T5/VAE tensors were exactly equal before and after restart.
 The formal run retains warmup/cosine. It is a chain validation, not evidence of
 convergence or task success. Full five-epoch training and post-training C2R
 evaluation remain to be completed.
+
+Final-collection validation on 2026-10-24 passed on all 2500 episodes / 552498
+frames. The actual reader checked 650 chunks across all 50 tasks: reference
+loss was exactly zero, and every task had finite nonzero perturbation gradients.
+A four-H200 run with microbatch 16 and accumulation 4 passed actual optimizer,
+save, fresh-process restore and next-update checks. Its microstep/optimizer-step
+pairs were (4, 1) and (8, 2), with finite losses and gradients and changed action
+weights. Observed peak GPU memory during this test was about 71 GiB per device.
+The gate then started a fresh five-epoch run in
+`experiments/c2r_meta_e5_bs256_4gpu`. The earlier eight-GPU run stopped at
+microstep 620 / optimizer step 310 before its first periodic checkpoint; no
+saved formal weights were available to resume. Its logs remain intact. The
+four-GPU run starts from the original Foundation weights and saves complete
+state every 200 microsteps, retaining the latest two checkpoints. Training
+completion and independent C2R success measurements are still pending.
 
 `scripts/robotwin_training_gate.py --plan <plan.json>` provides the unattended
 workflow; start from `configs/robotwin_clean50_gate.example.json`. It waits for
