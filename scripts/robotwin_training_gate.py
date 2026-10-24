@@ -40,11 +40,26 @@ def publication_status(root):
 def validate_plan(plan):
     if plan['num_epochs'] != 5 or plan['global_batch'] != 256:
         raise ValueError('This experiment was requested as 5 epochs / global batch 256')
-    world = len(plan['gpus'])
+    gpus = plan['gpus']
+    world = len(gpus)
     micro = plan['micro_batch']
-    if world != 8 or micro < 1 or 256 % (world*micro):
-        raise ValueError('Require 8 GPUs and microbatch dividing global batch 256')
+    if (not world or any(type(gpu) is not int or gpu < 0 for gpu in gpus)
+            or len(set(gpus)) != world or type(micro) is not int
+            or micro < 1 or 256 % (world*micro)):
+        raise ValueError('Require distinct GPU indices and world size × microbatch dividing global batch 256')
     return 256 // (world*micro)
+
+
+def expected_training_steps(windows, plan):
+    """Count microsteps after Accelerate shards/pads the per-rank dataloaders."""
+    validate_plan(plan)
+    return plan['num_epochs']*math.ceil(windows/(len(plan['gpus'])*plan['micro_batch']))
+
+
+def training_command(plan, root):
+    validate_plan(plan)
+    return [plan['python'], '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
+            f"--nproc-per-node={len(plan['gpus'])}", 'scripts/train.py', '--config-path', str(root)]
 
 
 def selected_checkpoint(plan):
@@ -92,7 +107,7 @@ def make_config(plan, snapshot, checkpoint):
     cfg.training.constraints.require_full_coverage = True
     cfg.training.finetune_ckpt_path = checkpoint
     cfg.training.output_path = str(Path(plan['run_root'])/'training')
-    cfg.training.save_steps = 2000
+    cfg.training.save_steps = plan.get('save_steps', 2000)
     cfg.training.save_full_states_for_resume = True
     cfg.training.keep_last_k_ckpts = 2
     cfg.training.metrics_jsonl = True
@@ -273,8 +288,7 @@ def run_gate(plan_path):
             state('waiting_for_gpus', processes=busy)
             time.sleep(30)
         cuda = ','.join(map(str, plan['gpus']))
-        launch = [python, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1', '--nproc-per-node=8',
-                  'scripts/train.py', '--config-path', str(root)]
+        launch = training_command(plan, root)
         smoke = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
         smoke.training.output_path = str(root/'smoke')
         smoke.training.max_steps = accum
@@ -300,16 +314,17 @@ def run_gate(plan_path):
         metrics = check_smoke(run, accum, resumed=True)
         if not weights_changed(str(run/f'checkpoint_step_{accum}.safetensors'), str(run/f'checkpoint_step_{accum*2}.safetensors')):
             raise ValueError('Resumed action model weights did not update')
-        atomic_json(root/'smoke_passed.json', {'passed': True, 'metrics': metrics, 'world_size': 8,
+        atomic_json(root/'smoke_passed.json', {'passed': True, 'metrics': metrics, 'world_size': len(plan['gpus']),
                                              'global_batch': 256, 'resume_tested': True})
-        state('training', config=str(root/'train.yaml'), epochs=5, global_batch=256)
+        state('training', config=str(root/'train.yaml'), epochs=5, global_batch=256,
+              world_size=len(plan['gpus']), micro_batch=plan['micro_batch'], gradient_accumulation_steps=accum)
         execute(launch+['--config-name=train'], 'training.log', cuda=cuda)
         runs = [p.parent for p in (root/'training').glob('*/config.yaml')]
         if len(runs) != 1 or not list(runs[0].glob('checkpoint_step_*.safetensors')):
             raise ValueError('Training returned without its checkpoint')
         rows = [json.loads(line) for line in (runs[0]/'metrics.jsonl').read_text().splitlines()]
         windows = json.loads((root/'reader_audit.json').read_text())['windows_per_epoch']
-        expected_steps = 5*math.ceil(windows/(8*plan['micro_batch']))
+        expected_steps = expected_training_steps(windows, plan)
         if not rows or rows[-1]['step'] != expected_steps or rows[-1]['epoch'] != 4:
             raise ValueError('Training did not complete the requested five full epochs')
         state('complete', run=str(runs[0]))

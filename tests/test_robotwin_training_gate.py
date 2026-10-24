@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 
 from scripts.robotwin_training_gate import (
-    check_smoke, copy_snapshot, publication_status, selected_checkpoint, validate_plan,
+    check_smoke, copy_snapshot, expected_training_steps, publication_status,
+    selected_checkpoint, training_command, validate_plan,
 )
 
 
@@ -12,10 +13,27 @@ def test_batch_is_global_and_accumulation_is_exact():
     plan = {'num_epochs': 5, 'global_batch': 256, 'gpus': list(range(8)), 'micro_batch': 2}
     assert validate_plan(plan) == 16
     assert validate_plan(dict(plan, micro_batch=8)) == 4
+    assert validate_plan(dict(plan, gpus=list(range(4)), micro_batch=16)) == 4
     with pytest.raises(ValueError):
         validate_plan(dict(plan, micro_batch=3))
     with pytest.raises(ValueError):
         validate_plan(dict(plan, global_batch=128))
+
+
+@pytest.mark.parametrize('gpus', [[], [0, 0, 1, 2], [-1, 0, 1, 2], [False, 1, 2, 3]])
+def test_invalid_gpu_selections_are_rejected(gpus):
+    with pytest.raises(ValueError):
+        validate_plan({'num_epochs': 5, 'global_batch': 256, 'gpus': gpus, 'micro_batch': 16})
+
+
+def test_four_gpu_launch_and_five_epoch_completion_use_actual_world_size():
+    plan = {'num_epochs': 5, 'global_batch': 256, 'gpus': [0, 1, 2, 3],
+            'micro_batch': 16, 'python': '/env/bin/python'}
+    command = training_command(plan, '/run')
+    assert '--nproc-per-node=4' in command
+    assert '--nproc-per-node=8' not in command
+    assert expected_training_steps(549998, plan) == 42970
+    assert expected_training_steps(549998, dict(plan, gpus=list(range(8)))) == 21485
 
 
 def test_publication_requires_each_task_and_completed_annotation(tmp_path):

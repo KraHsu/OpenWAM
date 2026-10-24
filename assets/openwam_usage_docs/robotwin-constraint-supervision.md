@@ -200,10 +200,16 @@ all 50 tasks × 50 published episodes and completed annotations, requires an
 explicit compatible checkpoint, copies an independent dataset snapshot, audits
 all frames/JPEGs/labels and distinct initial scenes, and builds fresh clean-only
 normalization statistics. It then checks the actual normalized/unified reader,
-waits for free GPUs, and runs an 8-GPU optimizer/save/restart/resume smoke test.
+waits for free GPUs, and runs an optimizer/save/restart/resume smoke test using
+the GPU indices in the plan.
 Only after those checks pass does it start a fresh 5-epoch run with effective
 global batch 256 (8 × microbatch 16 × accumulation 2 in the example; the epoch tail
-can be a smaller batch). Smoke updates are discarded. A failure stops the gate
+can be a smaller batch). A four-GPU plan uses `gpus: [0, 1, 2, 3]`, microbatch
+16 and accumulation 4 for the same global batch. Launch process counts and
+five-epoch completion checks follow the selected world size. Optional plan
+`save_steps` controls checkpoint frequency in microsteps (default 2000); the
+four-GPU restart uses 200 to reduce work lost to interruptions. Smoke updates
+are discarded. A failure stops the gate
 with `state.json` and logs; it never retries a failed full training run implicitly.
 Checkpoint saves now wait for completed accumulation, and legacy checkpoints
 saved mid-accumulation are rejected on resume. Fixed reference anchors are a
