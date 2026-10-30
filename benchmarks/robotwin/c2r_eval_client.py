@@ -42,6 +42,37 @@ def prepare_private_runtime():
 
 
 def main():
+    if sys.argv[1:] == ["--render-probe"]:
+        # Run only after training releases the GPU. CUDA availability alone does
+        # not establish that the Vulkan loader can create a render device.
+        wrapper._prewarm_cuda_for_curobo()
+        import sapien
+
+        renderer = sapien.render.RenderSystem(device="cuda:0")
+        scene = sapien.Scene([sapien.physx.PhysxCpuSystem(), renderer])
+        scene.set_ambient_light([0.5, 0.5, 0.5])
+        builder = scene.create_actor_builder()
+        builder.add_box_visual(half_size=[0.1, 0.1, 0.1])
+        builder.build_static()
+        camera = scene.add_camera("probe", 64, 64, 1.0, 0.1, 10)
+        camera.set_entity_pose(sapien.Pose([-1, 0, 0]))
+        scene.update_render()
+        camera.take_picture()
+        picture = camera.get_picture("Color")
+        assert picture.shape == (64, 64, 4)
+        assert float(picture[..., :3].std()) > 0
+        print(
+            json.dumps(
+                {
+                    "renderer": str(renderer.device),
+                    "pci": renderer.device.pci_string,
+                    "shape": list(picture.shape),
+                    "passed": True,
+                }
+            ),
+            flush=True,
+        )
+        return 0
     prepare_private_runtime()
     original_load = wrapper._load_robotwin_eval_module
 

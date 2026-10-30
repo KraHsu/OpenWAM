@@ -225,6 +225,7 @@ def preflight(plan):
         "native_eval_sha256": sha256(native / "script/eval_policy.py"),
         "random_config_sha256": sha256(native / "task_config/demo_randomized.yml"),
         "native_compat_sha256": sha256(Path(plan["rax_root"]) / "services/robotwin/native_compat.py"),
+        "vulkan_icd_sha256": sha256(plan["vulkan_icd"]) if plan.get("vulkan_icd") else None,
         "source_sha256": {name: sha256(ROOT / name) for name in sources},
     }
 
@@ -295,6 +296,12 @@ def client_environment(plan, gpu, directory):
     )
     env.pop("ROBOTWIN_ENABLE_PLANNER_FALLBACK", None)
     env.pop("ROBOTWIN_SKIP_VERSION_CHECK", None)
+    if plan.get("vulkan_icd"):
+        # Select the existing headless NVIDIA EGL ICD for this child only.
+        # Some compute images have GLX installed but lack libEGL.so.1, causing
+        # its default Vulkan ICD to fail even when CUDA works correctly.
+        env["VK_ICD_FILENAMES"] = plan["vulkan_icd"]
+        env["VK_DRIVER_FILES"] = plan["vulkan_icd"]
     egl = (
         Path(plan["robotwin_python"]).parent.parent
         / "lib/python3.10/site-packages/sapien/vulkan_library/10_nvidia.json"
@@ -360,6 +367,21 @@ class Gate:
             "--render-device",
             "cuda:0",
         ]
+
+    def probe_renderers(self):
+        def probe(gpu):
+            directory = self.root / "render_probes" / f"gpu{gpu}-{time.time_ns()}"
+            command = [
+                self.plan["robotwin_python"],
+                str(ROOT / "benchmarks/robotwin/c2r_eval_client.py"),
+                "--render-probe",
+            ]
+            self.execute(command, directory, client_environment(self.plan, gpu, directory), 120)
+
+        with ThreadPoolExecutor(max_workers=len(self.plan["gpus"])) as executor:
+            futures = [executor.submit(probe, gpu) for gpu in self.plan["gpus"]]
+            for future in as_completed(futures):
+                future.result()
 
     def build_manifest(self, task, gpu):
         path = self.root / "manifests" / f"{task}.json"
@@ -576,15 +598,17 @@ class Gate:
                 # Recheck after the wait: edits made while training must not
                 # silently change an already armed benchmark protocol.
                 bind_json(self.root / "preflight.json", preflight(self.plan))
+                self.state("probing_renderers")
+                self.probe_renderers()
                 self.state("freezing_checkpoint", checkpoint=str(checkpoint))
                 self.freeze_model(checkpoint)
-                self.state("building_manifests", tasks=50, episodes_per_task=10)
-                self.pool("build_manifest")
+                first = self.plan["tasks"][0]
+                self.state("building_smoke_manifest", task=first, episodes_per_task=10)
+                self.build_manifest(first, self.plan["gpus"][0])
                 servers = [
                     PolicyServer(self, gpu, self.plan["base_port"] + i) for i, gpu in enumerate(self.plan["gpus"])
                 ]
                 try:
-                    first = self.plan["tasks"][0]
                     self.state("smoke_eval", task=first, episodes=1)
                     if not self.completed_prefix(first):
                         self.evaluate_range(first, servers[0], 0, 1)
@@ -600,6 +624,9 @@ class Gate:
                             "requires_task_success": False,
                         },
                     )
+                    servers[0].close()
+                    self.state("building_manifests", tasks=50, episodes_per_task=10)
+                    self.pool("build_manifest")
                     self.state("evaluating", tasks=50, episodes_per_task=10)
                     self.pool("run_eval", servers)
                 finally:

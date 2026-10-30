@@ -12,12 +12,14 @@ The benchmark covers all 50 tasks from `labtasker_runtime.ROBOTWIN_TASKS`, with
 The installed native RoboTwin commit and configuration hashes are recorded. Its
 own scene sampling, expert eligibility check, success predicates, and step limits
 are used. Starting at native test seed 100000, the first ten expert-eligible
-seeds for each task are sealed before model evaluation. Both instructions and
+seeds for each task are sealed before that task's model evaluation. Both instructions and
 seeds remain fixed for retries and resumed runs.
 
-Four workers build manifests, then one real policy episode checks the deployment
-and simulation path. That episode counts toward the 500 outcomes regardless of
-success. Four policy servers then evaluate one task per GPU. Each server uses
+After training, a rendered-image probe checks every GPU. The first task's
+manifest and one real policy episode check the deployment and simulation path
+before the remaining manifests are built on four workers. That episode counts
+toward the 500 outcomes regardless of success. Four policy servers then evaluate
+one task per GPU. Each server uses
 the same final weights, ten synchronous denoising steps, the full action chunk,
 and the repository's deploy optimization defaults, copied to `deploy.yml`.
 
@@ -27,6 +29,13 @@ The installed revision's legacy `place_fan` reward constructor uses the same
 narrow RAX compatibility adapter as clean data collection. No planner fallback
 is enabled. Local and remote source trees and native task configuration stay
 unchanged by evaluation.
+
+The H200 image's default GLX Vulkan entry fails because `libEGL.so.1` is absent.
+The plan explicitly selects its already installed NVIDIA EGL ICD with child-only
+`VK_ICD_FILENAMES`/`VK_DRIVER_FILES`. No driver install or global environment edit
+is needed. The original failed run remains at `c2r_random50x10_final`; the
+corrected run uses `c2r_random50x10_final_v2` and retains the same 500-episode
+protocol. GPU rendering probes run after training, before any expert scan.
 
 ## Launch
 

@@ -245,3 +245,14 @@ def test_selected_gpus_must_be_idle(monkeypatch):
     assert gate.gpu_processes([1]) == ["GPU-b, 101, python"]
     with pytest.raises(ValueError):
         gate.gpu_processes([2])
+
+
+def test_vulkan_override_is_child_scoped(plan, tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("VK_ICD_FILENAMES", "/original/driver.json")
+    plan["vulkan_icd"] = "/headless/nvidia.json"
+    env = gate.client_environment(plan, 2, tmp_path)
+    assert env["VK_ICD_FILENAMES"] == env["VK_DRIVER_FILES"] == plan["vulkan_icd"]
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert os.environ["VK_ICD_FILENAMES"] == "/original/driver.json"

@@ -1,7 +1,7 @@
 {
   "train_root": "/mnt/data/liangjiaqi/rax_train/experiments/c2r_meta_e5_bs256_4gpu",
   "train_output": "/mnt/data/liangjiaqi/rax_train/experiments/c2r_meta_e5_bs256_4gpu/training/2026-10-24_17-58-00",
-  "run_root": "/mnt/data/liangjiaqi/rax_train/experiments/c2r_random50x10_final",
+  "run_root": "/mnt/data/liangjiaqi/rax_train/experiments/c2r_random50x10_final_v2",
   "openwam_root": "/mnt/data/liangjiaqi/rax_train/OpenWAM",
   "robotwin_root": "/mnt/data/liangjiaqi/RoboTwin",
   "rax_root": "/mnt/data/liangjiaqi/rax_train/rax",
@@ -73,5 +73,6 @@
   "poll_seconds": 30,
   "manifest_timeout_seconds": 7200,
   "eval_timeout_seconds": 14400,
-  "server_start_timeout_seconds": 1800
+  "server_start_timeout_seconds": 1800,
+  "vulkan_icd": "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
 }
