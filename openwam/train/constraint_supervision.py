@@ -3,19 +3,22 @@
 No operation classes, external label manifest, simulator or dynamics model.
 The callback receives the differentiable clean estimate, not a velocity field.
 """
-from collections import Counter, defaultdict
-from dataclasses import dataclass
 import hashlib
 import json
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from openwam.train.constraint_schema import canonical_json, number, validate_bundle
+from openwam.train.constraint_calibration import timestep_factors
 from openwam.train.constraint_coverage import chunk_candidate, coverage_report
-from openwam.train.meta_constraints import residual, penalty
+from openwam.train.constraint_schema import canonical_json, number, validate_bundle
+from openwam.train.meta_constraints import penalty, residual
+
+SIGMA_BINS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 @dataclass
 class ActionDecoder:
@@ -56,8 +59,22 @@ class ActionDecoder:
 
 
 class RoboTwinConstraintObjective:
-    def __init__(self, dataset, dataset_root, *, weight, execution_horizon=None, require_full_coverage=True):
+    def __init__(self, dataset, dataset_root, *, weight, execution_horizon=None, require_full_coverage=True,
+                 timestep_strategy='clean', sigma_floor=0.05, penalty_scale_overrides=None):
         self.weight = number(weight, positive=True)
+        if timestep_strategy not in ('clean', 'fm_matched'):
+            raise ValueError('timestep_strategy must be clean or fm_matched')
+        self.timestep_strategy = timestep_strategy
+        self.sigma_floor = number(sigma_floor, positive=True)
+        if self.sigma_floor > 1:
+            raise ValueError('sigma_floor must be at most 1')
+        from openwam.train.constraint_schema import KINDS
+        self.penalty_scale_overrides = dict(penalty_scale_overrides or {})
+        if set(self.penalty_scale_overrides) - set(KINDS):
+            raise ValueError('Unknown constraint kind in penalty_scale_overrides')
+        self.penalty_scale_overrides = {
+            kind: number(scale, positive=True) for kind, scale in self.penalty_scale_overrides.items()
+        }
         if execution_horizon is not None and (type(execution_horizon) is not int or execution_horizon < 1):
             raise ValueError('execution_horizon must be null or a positive integer')
         self.execution_horizon = execution_horizon
@@ -104,7 +121,10 @@ class RoboTwinConstraintObjective:
                                        sort_keys=True) for d, _, _, _ in self.episodes.values()})
         return {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
                 'matched_constraints': self.matched_constraints, 'status_counts': dict(self.store.status_counts),
-                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v3_reference_anchor',
+                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v4_fp32_window_calibration',
+                'timestep_strategy': self.timestep_strategy, 'sigma_floor': self.sigma_floor,
+                'penalty_scale_overrides': self.penalty_scale_overrides,
+                'sigma_bins': list(SIGMA_BINS), 'reduction': 'global_active_constraint_weight_mean',
                 'require_full_coverage': self.require_full_coverage,
                 'fully_covered_episodes': sum(r['complete'] for r in self.coverage.values()),
                 'execution_horizon': self.execution_horizon, 'gradient_entry': 'single_step_clean_action_estimate',
@@ -134,12 +154,36 @@ class RoboTwinConstraintObjective:
             candidates = [c for c in entry[1] if chunk_candidate(c, int(sample['start_frame']), horizon)]
             entries.append((entry[0], candidates, entry[2], entry[3], sample))
 
-        def evaluate(clean_actions):
+        def evaluate(clean_actions, *, fm_sigma=None, fm_timestep_weight=None):
             if clean_actions.ndim != 3 or clean_actions.shape[0] != len(entries):
                 raise ValueError('Expected clean actions [batch,horizon,action_dim]')
+            if (fm_sigma is None) != (fm_timestep_weight is None):
+                raise ValueError('Both FM sigma and timestep weight must be supplied together')
+            if fm_sigma is None:
+                if self.timestep_strategy != 'clean':
+                    raise ValueError('fm_matched constraints require FM timestep context')
+                factors = clean_actions.new_ones(len(entries), dtype=torch.float32)
+                sigmas = None
+            else:
+                sigmas = torch.as_tensor(fm_sigma, device=clean_actions.device, dtype=torch.float32).detach()
+                fm_weights = torch.as_tensor(fm_timestep_weight, device=clean_actions.device, dtype=torch.float32).detach()
+                if sigmas.shape != (len(entries),) or fm_weights.shape != sigmas.shape:
+                    raise ValueError('FM context must have shape [batch]')
+                factors = timestep_factors(sigmas, fm_weights, strategy=self.timestep_strategy,
+                                           sigma_floor=self.sigma_floor)
+            # One device synchronization per batch, never one per constraint.
+            sigma_bin_indices = None if sigmas is None else (sigmas*4).long().clamp_max(3).cpu().tolist()
             losses, weights, violations = [], [], defaultdict(list)
             from openwam.train.constraint_schema import KINDS
-            for prediction, (decoder, constraints, convention, _, sample) in zip(clean_actions, entries, strict=True):
+            zero = clean_actions.new_zeros((), dtype=torch.float32)
+            contributions = {kind: zero.clone() for kind in KINDS}
+            raw_contributions = {kind: zero.clone() for kind in KINDS}
+            kind_weights = Counter()
+            bin_losses = [zero.clone() for _ in range(len(SIGMA_BINS)-1)]
+            bin_weights = [0.0 for _ in bin_losses]
+            bin_counts = [0 for _ in bin_losses]
+            for sample_index, (prediction, (decoder, constraints, convention, _, sample)) in enumerate(
+                    zip(clean_actions, entries, strict=True)):
                 if not constraints:
                     continue
                 reference = torch.as_tensor(sample['action'], device=prediction.device).detach()
@@ -159,8 +203,23 @@ class RoboTwinConstraintObjective:
                     if v is None:
                         continue
                     w = c['penalty']['weight']
-                    losses.append(w*penalty(v, c['penalty'])); weights.append(w)
-                    violations[c['type']].append(v.detach())
+                    kind = c['type']
+                    spec = dict(c['penalty'])
+                    if kind in self.penalty_scale_overrides:
+                        spec['scale'] = self.penalty_scale_overrides[kind]
+                    raw_loss = w*penalty(v, spec)
+                    weighted_loss = factors[sample_index]*raw_loss
+                    losses.append(weighted_loss)
+                    weights.append(w)
+                    violations[kind].append(v.detach())
+                    raw_contributions[kind] += raw_loss.detach()
+                    contributions[kind] += weighted_loss.detach()
+                    kind_weights[kind] += w
+                    if sigma_bin_indices is not None:
+                        index = sigma_bin_indices[sample_index]
+                        bin_losses[index] += weighted_loss.detach()
+                        bin_weights[index] += w
+                        bin_counts[index] += 1
             numerator = torch.stack(losses).sum() if losses else clean_actions.reshape(-1)[:0].sum()
             denominator = clean_actions.new_tensor(sum(weights), dtype=torch.float32)
             local_weight = denominator.clone()
@@ -169,13 +228,22 @@ class RoboTwinConstraintObjective:
                 torch.distributed.all_reduce(denominator)
                 world_size = torch.distributed.get_world_size()
             loss = self.weight*numerator*world_size/denominator.clamp_min(1e-12)
-            metrics = {'constraint_count': clean_actions.new_tensor(float(len(losses))), 'constraint_weight_sum': local_weight}
+            metrics = {'constraint_count': zero.new_tensor(float(len(losses))),
+                       'constraint_weight_sum': local_weight, 'constraint_objective_weight': zero.new_tensor(self.weight)}
             for kind in KINDS:
                 v = torch.cat(violations[kind]) if violations[kind] else clean_actions.new_empty(0)
                 metrics.update({f'{kind}_count': v.new_tensor(float(v.numel())), f'{kind}_residual_sum': v.sum(),
                                 f'{kind}_residual_max': v.max() if v.numel() else v.new_zeros(()),
-                                f'{kind}_violation_count': (v > 0).float().sum()})
+                                f'{kind}_violation_count': (v > 0).float().sum(),
+                                f'{kind}_penalty_sum': contributions[kind],
+                                f'{kind}_raw_penalty_sum': raw_contributions[kind],
+                                f'{kind}_weight_sum': zero.new_tensor(kind_weights[kind])})
+            for index, (bin_loss, bin_weight, bin_count) in enumerate(zip(bin_losses, bin_weights, bin_counts)):
+                metrics.update({f'sigma_bin_{index}_penalty_sum': bin_loss,
+                                f'sigma_bin_{index}_weight_sum': zero.new_tensor(bin_weight),
+                                f'sigma_bin_{index}_count': zero.new_tensor(bin_count)})
             return {'loss': loss, 'metrics': metrics}
+        evaluate.accepts_fm_context = True
         return evaluate
 
 
@@ -196,7 +264,10 @@ def build_constraint_objective(cfg, dataset):
         raise ValueError('External manifests are obsolete; embed constraints in each HDF5 episode')
     return RoboTwinConstraintObjective(dataset, cfg.dataloader.dataset_dir, weight=weight,
                                        execution_horizon=settings.get('execution_horizon'),
-                                       require_full_coverage=settings.get('require_full_coverage', True))
+                                       require_full_coverage=settings.get('require_full_coverage', True),
+                                       timestep_strategy=settings.get('timestep_strategy', 'clean'),
+                                       sigma_floor=settings.get('sigma_floor', 0.05),
+                                       penalty_scale_overrides=settings.get('penalty_scale_overrides', {}))
 
 
 def validate_constraint_resume(output_path, objective):
@@ -226,6 +297,10 @@ def reduce_constraint_metrics(accelerator, losses):
         for i, name in enumerate(names)
     }
     report = {"constraint_count": totals["constraint_count"]}
+    # Every rank uses the same objective coefficient; do not sum it as a count.
+    objective_weight = values[:, names.index('constraint_objective_weight')].mean().item() if 'constraint_objective_weight' in names else 1.0
+    weight_sum = totals.get('constraint_weight_sum', 0.0)
+    denominator = max(weight_sum, 1e-12)
     for kind in sorted(name.removesuffix("_residual_sum") for name in totals if name.endswith("_residual_sum")):
         count = totals[f"{kind}_count"]
         report[f"{kind}_count"] = count
@@ -233,6 +308,16 @@ def reduce_constraint_metrics(accelerator, losses):
             report[f"{kind}_residual_mean"] = totals[f"{kind}_residual_sum"] / count
             report[f"{kind}_residual_max"] = totals[f"{kind}_residual_max"]
             report[f"{kind}_violation_rate"] = totals[f"{kind}_violation_count"] / count
+        if f'{kind}_penalty_sum' in totals:
+            report[f'{kind}_loss_contribution'] = objective_weight*totals[f'{kind}_penalty_sum']/denominator
+            report[f'{kind}_raw_loss_contribution'] = objective_weight*totals[f'{kind}_raw_penalty_sum']/denominator
+            report[f'{kind}_weight_sum'] = totals[f'{kind}_weight_sum']
+    for index in range(len(SIGMA_BINS)-1):
+        prefix = f'sigma_bin_{index}'
+        if f'{prefix}_count' in totals:
+            report[f'{prefix}_count'] = totals[f'{prefix}_count']
+            report[f'{prefix}_loss_contribution'] = objective_weight*totals[f'{prefix}_penalty_sum']/denominator
+            report[f'{prefix}_weight_sum'] = totals[f'{prefix}_weight_sum']
     for name in ("constraint_candidate_count", "constraint_weight_sum"):
         if name in totals:
             report[name] = totals[name]

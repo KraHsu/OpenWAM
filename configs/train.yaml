@@ -47,6 +47,9 @@ training:
     weight: 0.0
     execution_horizon: null      # null: full chunk; integer: supervise executed prefix only
     require_full_coverage: true  # Every arm/action frame needs chunk-safe position/motion supervision.
+    timestep_strategy: clean    # Explicit clean-action objective; fm_matched is a separate ablation.
+    sigma_floor: 0.05           # fm_matched uses FM weight / max(sigma, floor)^2; not a tuned value.
+    penalty_scale_overrides: {} # Per-kind physical scales; never changes the allowed intervals.
 
   # --- Flow matching timestep range ---
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)

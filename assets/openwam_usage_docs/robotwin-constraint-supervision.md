@@ -25,6 +25,10 @@ uses active weights globally across DDP ranks. `power=2` is `squared_hinge`;
 continuous gradients at its boundary. At violation/scale > 1, the fourth power
 grows faster. Weight and scale have distinct roles: mixture importance versus
 physical normalization. The original action/video FM coefficients remain active.
+Consequently, this additive objective does **not** remove imitation penalties
+inside the allowed set: zero constraint loss still leaves the original FM loss.
+More varied observed actions alone cannot distinguish useful freedom from
+competing gradients or tracking errors.
 
 | Base type | Scalar u | Bounds / scale units |
 | --- | --- | --- |
@@ -84,6 +88,9 @@ chunk-safe position/motion constraint for every action frame of both arms.
 Gripper-only intervals and displacements requiring distant anchors do not count.
 Orientation and gripper freedoms remain task-specific. Use `false` only for an
 explicit sparse ablation, not the full-coverage experiment.
+This is temporal coverage, not geometric completeness: a single axial position
+interval can cover a frame while leaving the other axes unconstrained. It does
+not certify object contact, collision avoidance, progress, or task success.
 
 Schema 1.1 adds `motion_direction_cone`: for adjacent decoded positions, let
 `v=p[t]-p[t-1]`, `a=dot(n,v)`, and `b=norm(v-a*n)`. Its feature is
@@ -95,6 +102,21 @@ so short chunks need no distant anchor. Zero motion is allowed: task arrival
 still relies on interaction/endpoint constraints and the base loss. Direction
 slack, cone width, and stationary hold margins are declared priors, not physical
 success guarantees. Schema 1.0 remains readable for legacy data.
+
+Schema 1.3 adds `window_direction_cone`. Its reference segment has a fixed axis,
+an at-most-eight-step observation window, a minimum of two available steps, and
+a reference net-motion threshold. The predicted feature uses the net displacement
+over the same visible window instead of a first difference. Windows never cross
+the reference segment or chunk boundary. When the reference has moved less than
+5 mm, or fewer than two valid steps are available, a fixed segment bounding sphere
+provides position supervision. It covers the entire reference segment plus a
+20 mm prior, not a separate target around each reference frame. Reference turns
+and stops split segments. All branch decisions use reference data and masks;
+the prediction cannot disable the loss by pausing or keeping its gripper open.
+Direction still allows pausing; it does not impose task progress by itself.
+These values are declared motion priors, not verified physical tolerances.
+RAX policy v3 emits this new type. Existing 1.0–1.2 annotations retain their old
+semantics; no frozen dataset is rewritten automatically.
 
 The current official RoboTwin EEF reader reads **absolute** world targets, not
 deltas. Decoding reverses its exact 80D scatter (when used) and affine
@@ -114,6 +136,64 @@ For flow matching, with `a_sigma=(1-sigma)*a+sigma*noise` and velocity
 `v=noise-a`, constraints act on `a_hat=a_sigma-sigma*v_pred`. The callback runs
 after model forward, in float32, retaining gradients to the action head. It
 does not evaluate physical geometry directly on noise or velocity predictions.
+Reference actions now stay FP32 from `prepare_inputs` onward, as do noise,
+sigma, interpolation and FM targets. Only the model's forward input is cast to
+its compute dtype. Reconstruction uses the retained FP32 noisy sample; casting
+an already rounded BF16 sample back to FP32 is insufficient. Real BF16 model
+outputs can still have quantization error.
+
+## Calibration and issue #1 regression fixes
+
+New objectives record version `meta_intervals_v4_fp32_window_calibration` and
+explicit time/scale settings in provenance. Resume refuses mismatched settings;
+use a separate output directory and initialization for comparisons.
+
+- `timestep_strategy: clean` is the default and keeps the clean-action geometric
+  objective's time weighting. `fm_matched` is an optional ablation multiplying
+  each constraint by `FM_weight / max(sigma, sigma_floor)^2`; the denominator
+  remains the sum of active annotation weights, not the sum of time factors.
+  The default floor 0.05 is not tuned. This changes the objective and can greatly
+  amplify some time ranges. It cancels sigma-squared curvature for a quadratic
+  clean-coordinate error above the floor, not for arbitrary nonlinear, interval,
+  or quartic penalties. It does not make constraint and action losses comparable.
+- `penalty_scale_overrides: {kind: physical_scale}` changes outside-set curvature
+  without changing allowed intervals or the embedded labels. Set values only
+  after measuring loss and gradient behavior; no new tuned scales are claimed.
+- Metrics include each type's weighted loss contribution and four sigma bins
+  `[0,.25), [.25,.5), [.5,.75), [.75,1]`. Each collection of contributions sums
+  to the globally reduced constraint loss when FM context is supplied. Type
+  residual counts count elements; sigma-bin counts count active constraint
+  instances, not independent samples. `raw_loss_contribution` omits the time
+  factor but retains annotation weights, scales, and the global coefficient.
+
+For an isolated, unsharded diagnostic forward, use the actual weighted terms:
+
+```python
+from openwam.train.constraint_calibration import measure_loss_gradients
+
+result = architecture.compute_loss(
+    **architecture.prepare_inputs(batch),
+    action_loss_callback=objective.bind(batch),
+    lambda_video=lambda_video, lambda_action=lambda_action,
+    return_loss_terms=True,
+)
+report = measure_loss_gradients(result['loss_terms'], tuple(architecture.parameters()))
+```
+
+This retains the graph and reports norms, cosine similarities and norm ratios
+on exactly the supplied parameters without accumulating `.grad`. Zero-gradient
+cosines are undefined and reported as null. It does not aggregate DDP gradients
+or reconstruct sharded/ZeRO parameters; label any parameter subset explicitly.
+Run it outside an active distributed training job. The normal trainer does not
+enable these extra backward passes. CPU regression tests establish arithmetic
+and measurement behavior, not actual checkpoint gradient ratios or C2R gains.
+
+The next causal comparison is A: FP32 + FM-only; B: FP32 + original direction
+labels; C: FP32 + window-direction labels. Use identical initial weights, clean
+recordings, training budgets, evaluation manifests and inference settings.
+Keep the current historical run separate. Test time reweighting independently.
+Success should be evaluated per task on matching seeds, alongside constraint
+false acceptance on failed rollouts, not inferred from offline loss alone.
 
 ## Embedded data contract
 

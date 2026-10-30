@@ -6,7 +6,7 @@ degree of freedom is fixed. Rotation and gripper coverage are reported separatel
 """
 import math
 
-POSITION = {'axis_position_interval', 'radial_distance_interval', 'point_distance_interval', 'motion_direction_cone'}
+POSITION = {'axis_position_interval', 'radial_distance_interval', 'point_distance_interval', 'motion_direction_cone', 'window_direction_cone'}
 
 
 def active_range(c):
@@ -63,5 +63,6 @@ def coverage_report(constraints, length):
                         for kind, mask in groups.items()}
     covered = sum(all(masks[a]['position_or_motion'][i] for a in masks) for i in range(1, length))
     return {'version': 1, 'scope': 'position_or_motion_each_arm_each_action_frame',
+            'meaning': 'Temporal coverage only; not full geometric rank or a task-success certificate.',
             'initial_state_frame': 0, 'total': length-1, 'covered': covered, 'ratio': covered/(length-1),
             'complete': covered == length-1, 'chunk_safe': True, 'per_arm': per_arm}

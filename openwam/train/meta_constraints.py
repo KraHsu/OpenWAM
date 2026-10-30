@@ -18,6 +18,48 @@ def rotation_angle(r):
                        (r.diagonal(dim1=-2, dim2=-1).sum(-1)-1)*0.5)
 
 
+def window_direction_residual(pred, reference, valid, indices, dims, constraint, start_frame, basis):
+    """Reference-selected net-motion windows, with fixed segment-region fallback.
+
+    Old adjacent-step labels never enter this path. A short chunk, a turn/stop
+    boundary, missing padding dimensions, or negligible reference progress does
+    not reintroduce a one-step direction penalty. The fallback is one fixed
+    region for the entire labeled segment, not a per-frame reference target.
+    """
+    c, p = constraint, constraint['parameters']
+    lower_anchor = max(0, c['activation']['start']-1-start_frame)
+    anchors = (indices-p['window_steps']).clamp_min(lower_anchor)
+    count = indices-anchors
+    position_valid = valid[:, dims].all(-1)
+    invalid_prefix = torch.cat((indices.new_zeros(1), (~position_valid).long().cumsum(0)))
+    contiguous = invalid_prefix[indices+1] == invalid_prefix[anchors]
+    candidate = (count >= p['minimum_window_steps']) & contiguous
+    values = pred[indices, dims]
+    origin = values.new_tensor(c['reference_frame']['origin_m'])
+    result = (torch.linalg.vector_norm(values-origin, dim=-1)-p['fallback_radius_m']).clamp_min(0)
+    selected = torch.nonzero(candidate, as_tuple=False).flatten()
+    if selected.numel() == 0:
+        return result
+    ends, starts = indices[selected], anchors[selected]
+    reference_net = (reference[ends, dims]-reference[starts, dims]).detach()
+    if not torch.isfinite(reference_net).all():
+        raise ValueError('Non-finite reference position in a valid direction window')
+    enough_progress = torch.linalg.vector_norm(reference_net, dim=-1) >= p['minimum_reference_progress_m']
+    selected, ends, starts = selected[enough_progress], ends[enough_progress], starts[enough_progress]
+    if selected.numel() == 0:
+        return result
+    step = pred[ends, dims]-pred[starts, dims]
+    if not torch.isfinite(step).all():
+        raise ValueError('Non-finite predicted position in a valid direction window')
+    axis = basis @ values.new_tensor(p['axis'])
+    axial = (step*axis).sum(-1)
+    lateral = torch.linalg.vector_norm(step-axial[:, None]*axis, dim=-1)
+    scalar = torch.maximum(lateral-math.tan(p['half_angle_rad'])*axial, -axial).clamp_min(0)
+    low, high = p['bounds']
+    result = result.index_copy(0, selected, torch.relu(low-scalar)+torch.relu(scalar-high))
+    return result
+
+
 def residual(pred, reference, valid, constraint, *, start_frame, rotation_convention):
     """Return physical interval violations (m/rad/open fraction), or None.
 
@@ -70,6 +112,9 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
         raise ValueError('Non-finite predicted value in an active constraint')
     frame = c['reference_frame']
     basis = frame_rotation(frame['quaternion_wxyz'], values)
+    if kind == 'window_direction_cone':
+        return window_direction_residual(pred, reference, valid, torch.nonzero(active, as_tuple=False).flatten(),
+                                         dims, c, start_frame, basis)
     if kind == 'motion_direction_cone':
         indices = torch.nonzero(active, as_tuple=False).flatten()
         step = values-pred[indices-1, dims]

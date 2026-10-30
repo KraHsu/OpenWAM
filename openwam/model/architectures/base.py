@@ -912,7 +912,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             if action is not None:
                 if isinstance(action, np.ndarray):
                     action = torch.from_numpy(action)
-                action = action.to(dtype=_dtype, device=_device).unsqueeze(0)
+                # Labels must retain their original FP32 precision. Casting
+                # here would irreversibly quantize the reference before the
+                # FM target and physical clean-action constraints are formed.
+                action = action.to(dtype=torch.float32, device=_device).unsqueeze(0)
             all_actions.append(action)
 
             # Carry proprio whenever the sample provides it — the main-stream
@@ -1048,6 +1051,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         lambda_video: float = 1.0,
         lambda_action: float = 1.0,
         action_loss_callback=None,
+        return_loss_terms: bool = False,
         **inputs,
     ) -> dict:
         """Compute joint video-action flow matching loss.
@@ -1069,6 +1073,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             lambda_action: Weight for action loss term.
             action_loss_callback: Optional training-only callable receiving a
                 differentiable clean-action estimate and returning loss/metrics.
+            return_loss_terms: Retain weighted scalar terms for an explicit
+                offline gradient diagnostic; normal training logging stays detached.
             **inputs: Preprocessed video/text tensors plus forward-time flags.
 
         Returns:
@@ -1118,9 +1124,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
 
             action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)
-            action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=_dtype, device=_device)
+            action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=torch.float32, device=_device)
 
-            actions = actions.to(dtype=_dtype, device=_device)
+            actions = actions.to(dtype=torch.float32, device=_device)
             if actions.dim() == 2:
                 actions = actions.unsqueeze(0)
 
@@ -1129,6 +1135,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 a_sigma_bc = action_sigmas.view(B, 1, 1)
             else:
                 a_sigma_bc = action_sigmas.unsqueeze(-1)
+            # Keep the full FM arithmetic chain in FP32, including the noisy
+            # sample retained for reconstruction. Only the forward input is
+            # cast to the model dtype below; casting its rounded copy back to
+            # FP32 cannot recover a consistent clean estimate.
             noisy_actions = action_scheduler.add_noise(actions, action_noise, a_sigma_bc)
             action_target = action_scheduler.training_target(actions, action_noise)
 
@@ -1152,7 +1162,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # Use ``self(...)`` (not ``self.forward(...)``) so ``nn.Module.__call__``
         # is invoked and any architecture-level forward-pre-hooks fire.
         video_noise_pred, action_noise_pred = self(
-            noisy_actions if lambda_action > 0 else None,
+            noisy_actions.to(dtype=_dtype) if noisy_actions is not None else None,
             action_timesteps if lambda_action > 0 else None,
             proprio=proprio,
             use_gradient_checkpointing=use_grad_ckpt,
@@ -1199,6 +1209,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "loss_video": lambda_video * loss_video.detach(),
             "loss_action": lambda_action * loss_action.detach(),
         }
+        if return_loss_terms:
+            result["loss_terms"] = {"video": lambda_video * loss_video, "action": lambda_action * loss_action}
 
         if action_loss_callback is not None:
             # The scheduler predicts noise - data, with sigma=0 at clean data.
@@ -1206,10 +1218,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
             clean_actions = action_scheduler.flow_step(
                 action_noise_pred.float(), a_sigma_bc.float(), 0.0, noisy_actions.float()
             )
-            auxiliary = action_loss_callback(clean_actions)
+            if getattr(action_loss_callback, "accepts_fm_context", False):
+                auxiliary = action_loss_callback(
+                    clean_actions,
+                    fm_sigma=action_sigmas,
+                    fm_timestep_weight=action_scheduler.training_weight(action_timestep_ids).to(
+                        dtype=torch.float32, device=_device
+                    ),
+                )
+            else:
+                auxiliary = action_loss_callback(clean_actions)
             result["loss"] = result["loss"] + auxiliary["loss"]
             result["loss_constraint"] = auxiliary["loss"].detach()
             result["constraint_metrics"] = auxiliary.get("metrics", {})
+            if return_loss_terms:
+                result["loss_terms"]["constraint"] = auxiliary["loss"]
 
         return result
 

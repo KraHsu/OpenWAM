@@ -2,11 +2,11 @@
 import json
 import math
 
-SCHEMA_VERSION = '1.2'
+SCHEMA_VERSION = '1.3'
 HDF5_KEY = 'trajectory_constraints/json'
 KINDS = ('axis_position_interval', 'radial_distance_interval', 'point_distance_interval',
          'axis_angle_interval', 'axis_displacement_interval', 'angular_displacement_interval', 'gripper_interval',
-         'motion_direction_cone')
+         'motion_direction_cone', 'window_direction_cone')
 
 
 def keys(value, required, optional=()):
@@ -46,8 +46,10 @@ def validate_constraint(c, length=None):
         required.add('axis')
     if kind == 'axis_angle_interval':
         required.update(('local_axis', 'reference_axis'))
-    if kind == 'motion_direction_cone':
+    if kind in ('motion_direction_cone', 'window_direction_cone'):
         required.update(('axis', 'half_angle_rad'))
+    if kind == 'window_direction_cone':
+        required.update(('window_steps', 'minimum_window_steps', 'minimum_reference_progress_m', 'fallback_radius_m'))
     displacement = kind in ('axis_displacement_interval', 'angular_displacement_interval')
     keys(p, required, ('anchor',) if displacement else ())
     if displacement and p.get('anchor', 'predicted_start') not in ('predicted_start', 'reference_frame'):
@@ -65,9 +67,15 @@ def validate_constraint(c, length=None):
         raise ValueError('Angular bounds must lie in [0,pi] radians')
     if kind == 'gripper_interval' and not 0 <= lo <= hi <= 1:
         raise ValueError('Opening bounds must lie in [0,1], where 1=open')
-    if kind == 'motion_direction_cone':
+    if kind in ('motion_direction_cone', 'window_direction_cone'):
         if lo != 0 or hi < 0 or not 0 < number(p['half_angle_rad']) < math.pi/2:
             raise ValueError('Direction cone needs [0, slack_m] and half angle in (0,pi/2)')
+    if kind == 'window_direction_cone':
+        if (type(p['window_steps']) is not int or type(p['minimum_window_steps']) is not int
+                or not 2 <= p['minimum_window_steps'] <= p['window_steps'] <= 128):
+            raise ValueError('Window direction requires 2 <= minimum_window_steps <= window_steps <= 128')
+        number(p['minimum_reference_progress_m'], positive=True)
+        number(p['fallback_radius_m'], positive=True)
     activation = c['activation']
     keys(activation, ('mode', 'start', 'end'), ('event',))
     start, end = activation['start'], activation['end']
@@ -77,7 +85,7 @@ def validate_constraint(c, length=None):
         raise ValueError('Activation extends beyond the recorded episode')
     if activation['mode'] not in ('interval', 'endpoint', 'reference_event'):
         raise ValueError('Unknown activation mode')
-    if kind == 'motion_direction_cone' and (start < 1 or activation['mode'] != 'interval'):
+    if kind in ('motion_direction_cone', 'window_direction_cone') and (start < 1 or activation['mode'] != 'interval'):
         raise ValueError('Direction cones use adjacent positions at interval frames >= 1')
     if (activation['mode'] == 'reference_event') != ('event' in activation):
         raise ValueError('Only reference_event activation requires event metadata')
@@ -107,7 +115,7 @@ def validate_constraint(c, length=None):
 
 def validate_bundle(bundle, length=None):
     keys(bundle, ('schema_version', 'action_contract', 'provenance', 'constraints'))
-    if bundle['schema_version'] not in ('1.0', '1.1', SCHEMA_VERSION):
+    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', SCHEMA_VERSION):
         raise ValueError('Unsupported embedded constraint schema')
     contract = bundle['action_contract']
     keys(contract, ('position', 'rotation', 'quaternion_order', 'gripper', 'frame'))
@@ -129,10 +137,12 @@ def validate_bundle(bundle, length=None):
         raise ValueError('constraints must be a list of conjunctive base constraints')
     ids = set()
     for c in bundle['constraints']:
-        if 'anchor' in c['parameters'] and bundle['schema_version'] != SCHEMA_VERSION:
+        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', SCHEMA_VERSION):
             raise ValueError('Explicit displacement anchors require schema 1.2')
         if c['type'] == 'motion_direction_cone' and bundle['schema_version'] == '1.0':
             raise ValueError('Direction cones require schema 1.1')
+        if c['type'] == 'window_direction_cone' and bundle['schema_version'] != SCHEMA_VERSION:
+            raise ValueError('Window direction cones require schema 1.3')
         validate_constraint(c, length)
         if c['id'] in ids:
             raise ValueError('Duplicate constraint id')
