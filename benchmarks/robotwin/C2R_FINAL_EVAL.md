@@ -79,10 +79,12 @@ python scripts/robotwin_c2r_pipeline.py --plan benchmarks/robotwin/c2r_final_50x
 python scripts/robotwin_c2r_pipeline.py --plan benchmarks/robotwin/c2r_final_50x10.plan.json
 ```
 
-For the current run, the handoff already exists and the pipeline is running.
-Do not start the legacy gate or resume its paused coordinator. If the pipeline
-exits, the second command resumes committed episode prefixes using the existing
-handoff. `pipeline.lock` prevents duplicate pipeline instances. The scheduler
+The current run was stopped at the user's request on 2026-10-30 after 64
+committed episodes (19 successes). Its partial results, manifests and videos
+remain in place; this is not a complete C2R score. All owned evaluation processes
+were stopped. Do not restart this run or its legacy coordinator. For a different
+interrupted run that is intended to continue, the second command resumes
+committed episode prefixes using the existing handoff. `pipeline.lock` prevents duplicate pipeline instances. The scheduler
 records its source hash in `pipeline_provenance.json`; benchmark settings, model
 weights, sealed seeds, native eligibility and success criteria remain unchanged.
 
@@ -211,3 +213,23 @@ CPU. Actual native counterfactual replay needs simulator GPU access. As of
 is 142–156h. A provisional 24–48h acceptance budget must be calibrated by the
 first native pilot. It is not measured throughput and excludes unknown template
 repair cycles. A new model C2R benchmark is a separate step after training.
+
+
+### Native EEF frame correction found during acceptance
+
+The first acceptance baselines succeeded natively but exceeded the 5 mm tracking
+ceiling. The installed native cuRobo adapter subtracts the arm-base translation
+while omitting its fixed URDF rotation (left yaw 0.02 rad, right yaw 0.01 rad).
+Zero-parameter prediction from that omitted transform explains 95–96% of the
+active-left-arm position error on the three pilot baselines. A private complete
+SE(3) conversion was verified on the same three frozen first-seed baselines:
+maximum active-arm error fell from 7.9–11.4 mm to 2.1–3.1 mm, with native task
+success retained. The installed native source and stopped evaluation remain
+unchanged. Formal acceptance uses that adapter only during trial replay; expert
+reference capture remains native.
+
+Future baseline-versus-new-model C2R comparisons must record and use the same
+controller/frame adapter for both models. The incomplete legacy result alone
+cannot distinguish supervision effects from this controller error. Acceptance
+attempts retain their own code, measured trajectories, native outcomes and
+adapter identity so a correction cannot silently rewrite earlier evidence.
