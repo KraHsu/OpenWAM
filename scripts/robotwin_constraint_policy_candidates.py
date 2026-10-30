@@ -83,6 +83,19 @@ def ground_instruction_info(task, native, *, readonly_reader, expert, fingerprin
                           'scene_before': before}
 
 
+def validate_reference_initialization(task, reference, source):
+    """Reject references without fresh-state proof before starting native work."""
+    from services.robotwin.success_metadata import (
+        metadata_policy, validate_metadata_policy, validate_metadata_receipt,
+    )
+    policy = source.get('success_metadata_policy')
+    validate_metadata_policy(task, policy)
+    validate_metadata_receipt(task, reference.get('success_metadata'),
+                              reference['provenance']['scene_sha256'], policy=policy)
+    if metadata_policy(task) != policy:
+        raise ValueError('Native metadata runtime differs from frozen source context')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--reference', type=Path, required=True)
@@ -103,6 +116,7 @@ def main():
     from services.robotwin.collection import initial_scene, install_planner_cache, scene_fingerprint
     from services.robotwin.runtime import initialize_runtime, native_config, source_commit
     from services.robotwin.instruction_metadata import readonly_instruction_metadata
+    from services.robotwin.success_metadata import MARKER, initialize_success_metadata, metadata_policy
     from scripts.collect_robotwin_clean50 import play_expert
     from benchmarks.robotwin.openwam2robotwin_interface import ModelClient, _extract_eef_proprio
 
@@ -121,6 +135,7 @@ def main():
         raise ValueError('Reference and installed native version mismatch')
     if sha(args.reference) not in {v['sha256'] for v in source['reference_artifacts']}:
         raise ValueError('Reference is outside the frozen source manifest')
+    validate_reference_initialization(task, ref, source)
     n = len(arrays(ref['trajectory'])['left']['pose'])
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=False)
     manifest = dict(version=1, created_unix=time.time(), task=task, scene_seed=seed,
@@ -134,6 +149,8 @@ def main():
                     termination='fixed_reference_horizon_native_ever_success',
                     gripper_boundary='clip_to_native_0_1_with_raw_outputs_retained',
                     rotation_encoding='checkpoint_legacy_reader_client_roundtrip_native_wxyz')
+    if metadata_policy(task) is not None:
+        manifest['success_metadata_policy'] = metadata_policy(task)
     put(output/'configuration.json', manifest)
     put(output/'state.json', dict(phase='instruction_grounding', pid=os.getpid(), updated_unix=time.time()))
     initialize_runtime(); install_planner_cache()
@@ -149,6 +166,7 @@ def main():
             native.setup_demo(now_ep_num=0, seed=seed, is_test=False, **kwargs)
             if scene_fingerprint(initial_scene(native)) != ref['provenance']['scene_sha256']:
                 raise ValueError('Policy scene differs from frozen reference')
+            initialize_success_metadata(task, native, expected_scene_sha256=ref['provenance']['scene_sha256'])
             return native
         except BaseException:
             native.close_env(); raise
@@ -166,6 +184,8 @@ def main():
         native.close_env()
     native = factory()
     policy = None
+    if hasattr(native, MARKER):
+        manifest['success_metadata'] = getattr(native, MARKER)
     observations, raw_actions, plans, successes, actual = [], [], [], [], []
     rows = command_rows(ref['trajectory'])[:1].tolist()
     error = None
