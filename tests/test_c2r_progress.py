@@ -118,3 +118,22 @@ def test_ssh_failure_preserves_last_successful_snapshot(monkeypatch):
     assert monitor.snapshot()["data"] == original
     assert monitor.snapshot()["connected"] is False
     monitor.socket_dir.cleanup()
+
+
+def test_pipelined_phase_shows_eval_and_expert_workers_together(run):
+    root, plan = run
+    active_batch(root)
+    write(root / "state.json", dict(phase="pipelined_evaluation", pid=0))
+    write(root / "worker_1.json", dict(task="task_b", gpu=1, operation="build_manifest", active=True))
+    result = collect(plan)
+    assert {w["operation"] for w in result["workers"]} == {"build_manifest", "run_eval"}
+    assert result["completed_episodes"] == 4
+
+
+def test_completed_legacy_manifest_does_not_look_like_busy_gpu(run):
+    root, plan = run
+    write(root / "worker_1.json", dict(task="task_b", gpu=1, operation="build_manifest"))
+    write(root / "manifests/task_b.json", dict(entries=[{}] * 10))
+    result = collect(plan)
+    assert result["workers"] == []
+    assert result["tasks"][1]["status"] == "ready"

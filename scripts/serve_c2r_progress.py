@@ -67,6 +67,11 @@ class Monitor:
                 check=True,
             )
             data = json.loads(result.stdout)
+            if data.get("phase") == "pipelined_evaluation":
+                # Existing open pages already understand "evaluating". Keep
+                # them live without requiring a manual HTML reload.
+                data["scheduler_phase"] = data["phase"]
+                data["phase"] = "evaluating"
             with self.lock:
                 self.payload.update(data=data, connected=True, last_error=None, last_attempt=time.time())
         except (OSError, ValueError, subprocess.SubprocessError) as exc:

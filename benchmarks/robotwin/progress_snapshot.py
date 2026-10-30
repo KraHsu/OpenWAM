@@ -45,11 +45,15 @@ def collect(plan_path):
     expected = plan["episodes_per_task"]
     committed = {row["task"]: row for row in summary.get("tasks", [])}
     active = {}
-    if phase in ("building_manifests", "evaluating"):
+    if phase in ("building_manifests", "evaluating", "pipelined_evaluation"):
         operation = "build_manifest" if phase == "building_manifests" else "run_eval"
         for path in root.glob("worker_*.json"):
             worker = read_json(path)
-            if worker.get("operation") == operation:
+            if worker.get("active") is False:
+                continue
+            if worker.get("operation") == operation or (
+                phase == "pipelined_evaluation" and worker.get("operation") in ("build_manifest", "run_eval")
+            ):
                 active[worker["task"]] = worker
     elif phase in ("building_smoke_manifest", "smoke_eval"):
         task = state.get("task", plan["tasks"][0])
@@ -73,6 +77,10 @@ def collect(plan_path):
         scenes = min(scenes, expected)
         task_state = "complete" if confirmed == expected else "ready" if scenes == expected else "queued"
         worker = active.get(task)
+        # Legacy worker files persist after a shard finishes. A complete
+        # manifest must not make an idle GPU look like an active builder.
+        if worker and worker["operation"] == "build_manifest" and scenes == expected:
+            worker = None
         step = None
         if worker and confirmed < expected:
             building = worker["operation"] == "build_manifest"
