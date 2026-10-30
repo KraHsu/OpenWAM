@@ -80,3 +80,28 @@ python -m pytest -q tests/test_robotwin_c2r_gate.py
 
 The first actual GPU rollout intentionally runs only after training finishes;
 CPU checks do not claim to validate final model inference or task success.
+
+## Local live progress page
+
+Run on the local development machine:
+
+```bash
+python scripts/serve_c2r_progress.py --port 8767 --interval 10
+```
+
+Open `http://127.0.0.1:8767`. The server reads the current run selected by the
+remote plan over a dedicated SSH connection every ten seconds. It starts no
+remote web service and does not write evaluation files or read videos. Only the
+loopback HTTP listener is exposed. `--host`, `--ssh-port`, and `--remote-plan`
+can select another already authorized experiment server.
+
+The page separates expert scene preparation from model outcomes. Success rate
+uses ended model episodes, never expert eligibility successes. Active batches'
+ended episodes are shown as provisional until committed, without double counting
+the initial smoke episode or completed batches. Infrastructure retries discard
+only the failed attempt's provisional count. SSH outages retain the last good
+snapshot with a visible disconnected notice and its timestamp.
+
+The local launch record and log for the current session are under
+`../artifacts/c2r_evaluation/progress_monitor/`. CPU checks for progress aggregation
+and disconnect handling are in `tests/test_c2r_progress.py`.
