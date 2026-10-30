@@ -105,7 +105,7 @@ def main():
         raise ValueError('Reference is outside the frozen source manifest')
     n = len(arrays(ref['trajectory'])['left']['pose'])
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=False)
-    manifest = dict(version=1, task=task, scene_seed=seed,
+    manifest = dict(version=1, created_unix=time.time(), task=task, scene_seed=seed,
                     scene_sha256=ref['provenance']['scene_sha256'], reference_sha256=sha(args.reference),
                     source_manifest_sha256=sha(args.source_manifest), native_commit=source['native_commit'],
                     checkpoint_sha256=checkpoint['sha256'], checkpoint_receipt_sha256=sha(args.checkpoint_receipt),
