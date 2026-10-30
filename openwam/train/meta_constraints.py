@@ -69,9 +69,25 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     """
     c, kind = constraint, constraint['type']
     a, p = c['activation'], c['parameters']
-    offset = 0 if c['subject'] == 'left_eef' else 10
     frames = torch.arange(len(pred), device=pred.device) + start_frame
     active = (frames >= a['start']) & (frames < a['end']) & (frames > start_frame)
+    if kind == 'gripper_pair_max_interval':
+        if c['subject'] != 'both_grippers' or a['mode'] != 'interval':
+            raise ValueError('Joint gripper max needs both_grippers and a fixed reference interval')
+        # Decode into physical 20D first. Neither a padded arm nor a predicted
+        # gripper event may substitute for the other hand or change activation.
+        active &= valid[:, [9, 19]].all(-1)
+        if not active.any():
+            return None
+        values = pred[active][:, [9, 19]]
+        if not torch.isfinite(values).all():
+            raise ValueError('Non-finite predicted joint gripper opening')
+        scalar = torch.amax(values, dim=-1)
+        low, high = p['bounds']
+        return torch.relu(low-scalar)+torch.relu(scalar-high)
+    if c['subject'] not in ('left_eef', 'right_eef'):
+        raise ValueError('A per-arm constraint needs an explicit left/right subject')
+    offset = {'left_eef': 0, 'right_eef': 10}[c['subject']]
     if a['mode'] == 'endpoint':
         active &= frames == a['end']-1
     elif a['mode'] == 'reference_event':

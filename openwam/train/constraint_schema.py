@@ -2,11 +2,11 @@
 import json
 import math
 
-SCHEMA_VERSION = '1.3'
+SCHEMA_VERSION = '1.4'
 HDF5_KEY = 'trajectory_constraints/json'
 KINDS = ('axis_position_interval', 'radial_distance_interval', 'point_distance_interval',
          'axis_angle_interval', 'axis_displacement_interval', 'angular_displacement_interval', 'gripper_interval',
-         'motion_direction_cone', 'window_direction_cone')
+         'motion_direction_cone', 'window_direction_cone', 'gripper_pair_max_interval')
 
 
 def keys(value, required, optional=()):
@@ -34,12 +34,15 @@ def validate_constraint(c, length=None):
     if not isinstance(c['id'], str) or not c['id'].strip():
         raise ValueError('Constraint needs a nonempty id')
     kind = c['type']
-    if kind not in KINDS or c['subject'] not in ('left_eef', 'right_eef'):
+    subjects = ('both_grippers',) if kind == 'gripper_pair_max_interval' else ('left_eef', 'right_eef')
+    if kind not in KINDS or c['subject'] not in subjects:
         raise ValueError('Unsupported base constraint or subject; no object/contact inference')
     frame = c['reference_frame']
     keys(frame, ('origin_m', 'quaternion_wxyz'))
     vector(frame['origin_m'], 3)
     vector(frame['quaternion_wxyz'], 4, unit=True)
+    if kind == 'gripper_pair_max_interval' and frame != {'origin_m': [0, 0, 0], 'quaternion_wxyz': [1, 0, 0, 0]}:
+        raise ValueError('Joint gripper fractions use the canonical identity frame')
     p = c['parameters']
     required = {'bounds'}
     if kind in ('axis_position_interval', 'radial_distance_interval', 'axis_displacement_interval'):
@@ -65,7 +68,7 @@ def validate_constraint(c, length=None):
         raise ValueError('Distance bounds must be nonnegative')
     if kind in ('axis_angle_interval', 'angular_displacement_interval') and not 0 <= lo <= hi <= math.pi:
         raise ValueError('Angular bounds must lie in [0,pi] radians')
-    if kind == 'gripper_interval' and not 0 <= lo <= hi <= 1:
+    if kind in ('gripper_interval', 'gripper_pair_max_interval') and not 0 <= lo <= hi <= 1:
         raise ValueError('Opening bounds must lie in [0,1], where 1=open')
     if kind in ('motion_direction_cone', 'window_direction_cone'):
         if lo != 0 or hi < 0 or not 0 < number(p['half_angle_rad']) < math.pi/2:
@@ -85,6 +88,8 @@ def validate_constraint(c, length=None):
         raise ValueError('Activation extends beyond the recorded episode')
     if activation['mode'] not in ('interval', 'endpoint', 'reference_event'):
         raise ValueError('Unknown activation mode')
+    if kind == 'gripper_pair_max_interval' and activation['mode'] != 'interval':
+        raise ValueError('Joint gripper constraints use fixed reference intervals')
     if kind in ('motion_direction_cone', 'window_direction_cone') and (start < 1 or activation['mode'] != 'interval'):
         raise ValueError('Direction cones use adjacent positions at interval frames >= 1')
     if (activation['mode'] == 'reference_event') != ('event' in activation):
@@ -115,7 +120,7 @@ def validate_constraint(c, length=None):
 
 def validate_bundle(bundle, length=None):
     keys(bundle, ('schema_version', 'action_contract', 'provenance', 'constraints'))
-    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', SCHEMA_VERSION):
+    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', '1.3', SCHEMA_VERSION):
         raise ValueError('Unsupported embedded constraint schema')
     contract = bundle['action_contract']
     keys(contract, ('position', 'rotation', 'quaternion_order', 'gripper', 'frame'))
@@ -137,12 +142,14 @@ def validate_bundle(bundle, length=None):
         raise ValueError('constraints must be a list of conjunctive base constraints')
     ids = set()
     for c in bundle['constraints']:
-        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', SCHEMA_VERSION):
+        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', '1.3', SCHEMA_VERSION):
             raise ValueError('Explicit displacement anchors require schema 1.2')
         if c['type'] == 'motion_direction_cone' and bundle['schema_version'] == '1.0':
             raise ValueError('Direction cones require schema 1.1')
-        if c['type'] == 'window_direction_cone' and bundle['schema_version'] != SCHEMA_VERSION:
+        if c['type'] == 'window_direction_cone' and bundle['schema_version'] not in ('1.3', SCHEMA_VERSION):
             raise ValueError('Window direction cones require schema 1.3')
+        if c['type'] == 'gripper_pair_max_interval' and bundle['schema_version'] != SCHEMA_VERSION:
+            raise ValueError('Joint gripper max constraints require schema 1.4')
         validate_constraint(c, length)
         if c['id'] in ids:
             raise ValueError('Duplicate constraint id')
@@ -172,7 +179,9 @@ def validate_reference_events(bundle, handle):
         if c['evidence']['status'] != 'accepted' or a['mode'] != 'reference_event':
             continue
         e = a['event']; frame = e['frame']
-        arm = 'left' if c['subject'] == 'left_eef' else 'right'
+        if c['subject'] not in ('left_eef', 'right_eef'):
+            raise ValueError('Reference gripper events require one explicit arm')
+        arm = {'left_eef': 'left', 'right_eef': 'right'}[c['subject']]
         gripper = handle[f'endpose/{arm}_gripper']
         before, after = float(gripper[frame-1]), float(gripper[frame])
         direction = 1 if e['direction'] == 'increasing' else -1
