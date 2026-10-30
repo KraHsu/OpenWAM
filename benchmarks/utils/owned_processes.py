@@ -54,7 +54,7 @@ class ProcessRegistry:
             handle.close()
 
 
-def spawn_resource(command, *, cwd=None, env=None, stdout=None):
+def spawn_resource(command, *, cwd=None, env=None, stdout=None, pass_fds=()):
     """Launch through the sibling guardian; unspecified options inherit normally."""
     return subprocess.Popen(
         [sys.executable, str(Path(__file__).with_name("resource_process.py")), *command],
@@ -64,4 +64,8 @@ def spawn_resource(command, *, cwd=None, env=None, stdout=None):
         stdout=stdout,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        # A cooperative GPU lease may need to survive owner death until this
+        # guardian finishes cleaning its native/model child. The guardian's
+        # command still uses close_fds=True and does not inherit these leases.
+        pass_fds=pass_fds,
     )
