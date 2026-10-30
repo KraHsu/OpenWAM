@@ -121,7 +121,7 @@ class RoboTwinConstraintObjective:
                                        sort_keys=True) for d, _, _, _ in self.episodes.values()})
         return {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
                 'matched_constraints': self.matched_constraints, 'status_counts': dict(self.store.status_counts),
-                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v4_fp32_window_calibration',
+                'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v5_rigid_local_point',
                 'timestep_strategy': self.timestep_strategy, 'sigma_floor': self.sigma_floor,
                 'penalty_scale_overrides': self.penalty_scale_overrides,
                 'sigma_bins': list(SIGMA_BINS), 'reduction': 'global_active_constraint_weight_mean',

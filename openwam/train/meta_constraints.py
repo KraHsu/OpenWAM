@@ -3,6 +3,7 @@ import math
 import torch
 
 from openwam.train.action_trajectory import physical_rotation
+from openwam.train.constraint_schema import LOCAL_POINT_KINDS
 
 
 def frame_rotation(q, like):
@@ -16,6 +17,20 @@ def rotation_angle(r):
     skew = torch.stack((r[..., 2, 1]-r[..., 1, 2], r[..., 0, 2]-r[..., 2, 0], r[..., 1, 0]-r[..., 0, 1]), -1)
     return torch.atan2(torch.linalg.vector_norm(skew, dim=-1)*0.5,
                        (r.diagonal(dim1=-2, dim2=-1).sum(-1)-1)*0.5)
+
+
+def rigid_point_positions(position, orientation, parameters, rotation_convention):
+    """x = p + R r in physical world coordinates; r is fixed dataset geometry."""
+    point = parameters.get('local_point')
+    if point is None or not any(point['offset_m']):
+        return position
+    if not torch.isfinite(orientation).all():
+        raise ValueError('Non-finite orientation for a rigid local point')
+    rotation = physical_rotation(orientation, rotation_convention)
+    result = position + (rotation @ position.new_tensor(point['offset_m'])[..., None]).squeeze(-1)
+    if not torch.isfinite(result).all():
+        raise ValueError('Non-finite rigid local point position')
+    return result
 
 
 def window_direction_residual(pred, reference, valid, indices, dims, constraint, start_frame, basis):
@@ -69,6 +84,10 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     """
     c, kind = constraint, constraint['type']
     a, p = c['activation'], c['parameters']
+    point = p.get('local_point')
+    if point is not None and kind not in LOCAL_POINT_KINDS:
+        raise ValueError('local_point is only supported by position/distance primitives')
+    point_rotation = point is not None and any(point['offset_m'])
     frames = torch.arange(len(pred), device=pred.device) + start_frame
     active = (frames >= a['start']) & (frames < a['end']) & (frames > start_frame)
     if kind == 'gripper_pair_max_interval':
@@ -109,6 +128,9 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     else:
         dims = slice(offset, offset+3)
     active &= valid[:, dims].all(-1)
+    rotation_dims = slice(offset+3, offset+9)
+    if point_rotation:
+        active &= valid[:, rotation_dims].all(-1)
     if kind == 'motion_direction_cone':
         previous_valid = torch.cat((valid.new_zeros(1), valid[:-1, dims].all(-1)))
         active &= previous_valid
@@ -118,14 +140,19 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
     if (kind in ('axis_displacement_interval', 'angular_displacement_interval')
             and p.get('anchor', 'predicted_start') == 'predicted_start'):
         i = a['start']-start_frame
-        if i < 0 or i >= len(pred) or not valid[i, dims].all():
+        if (i < 0 or i >= len(pred) or not valid[i, dims].all()
+                or (point_rotation and not valid[i, rotation_dims].all())):
             return None
         initial = pred[i, dims]
         if not torch.isfinite(initial).all():
             raise ValueError('Non-finite displacement origin')
+        if point_rotation:
+            initial = rigid_point_positions(initial, pred[i, rotation_dims], p, rotation_convention)
     values = pred[active, dims]
     if not torch.isfinite(values).all():
         raise ValueError('Non-finite predicted value in an active constraint')
+    if point_rotation:
+        values = rigid_point_positions(values, pred[active, rotation_dims], p, rotation_convention)
     frame = c['reference_frame']
     basis = frame_rotation(frame['quaternion_wxyz'], values)
     if kind == 'window_direction_cone':

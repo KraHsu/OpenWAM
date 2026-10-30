@@ -329,3 +329,39 @@ python -m pytest tests/test_constraint_supervision.py \
 
 The cross-repository test expects the RAX fork beside OpenWAM. Run these tests
 on the existing H200 environment; local development needs only light checks.
+
+## Fixed EEF-local points (schema 1.5)
+
+The four position/distance types may optionally use a fixed local marker
+`x = p + R r` in place of the EEF origin `p`: `axis_position_interval`,
+`radial_distance_interval`, `point_distance_interval`, and
+`axis_displacement_interval`. Put `r` in
+`parameters.local_point={frame:"subject_eef",offset_m:[x,y,z],provenance:{...}}`.
+The required provenance contains `source` (`known_geometry` or `manual`), a
+nonempty `reference` and `rationale`, and a 64-character lowercase `sha256` of
+the geometry source. The frame is the decoded physical EEF frame; metres are
+explicit. These fields are immutable dataset geometry, not trainable offsets.
+No other primitive accepts this parameter, and it requires embedded schema 1.5.
+
+The existing interval loss applies to the transformed point, so gradients reach
+both position and the physical rotation, after inverse normalization, unified
+index selection and the legacy RoboTwin quaternion correction. No simulator or
+object pose is required. For a nonzero offset, the point and any predicted-start
+anchor need valid xyz and all six orientation dimensions. Invalid dimensions
+mask the feature; valid nonfinite/degenerate rotations raise instead of falling
+back to identity. An omitted or explicit zero offset preserves the old geometry
+and position-only mask, including when orientation is unavailable.
+
+The original displacement anchor may be row zero's measured state. It is
+detached by the objective and is not a generated-action loss sample. Anchors
+outside the chunk remain unavailable unless `anchor=reference_frame` is explicit;
+there is no added requirement for both endpoints to be generated. RAX compiles
+selection-based origins and long-span fixed anchors from the reference **marker**
+using the same transform. Existing reference event and phase activation remains
+fixed, and source schemas 1.0–1.4 retain their old meanings.
+
+A rigid kinematic marker is not automatically a fingertip contact point or a
+proof of object interaction. This implementation introduces no task-specific
+offset/tolerance, activates no templates and rewrites no existing annotations.
+The objective provenance version is `meta_intervals_v5_rigid_local_point`, so a
+resume can distinguish it from the prior evaluator even for unchanged data.

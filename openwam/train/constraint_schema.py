@@ -2,8 +2,10 @@
 import json
 import math
 
-SCHEMA_VERSION = '1.4'
+SCHEMA_VERSION = '1.5'
 HDF5_KEY = 'trajectory_constraints/json'
+LOCAL_POINT_KINDS = ('axis_position_interval', 'radial_distance_interval',
+                     'point_distance_interval', 'axis_displacement_interval')
 KINDS = ('axis_position_interval', 'radial_distance_interval', 'point_distance_interval',
          'axis_angle_interval', 'axis_displacement_interval', 'angular_displacement_interval', 'gripper_interval',
          'motion_direction_cone', 'window_direction_cone', 'gripper_pair_max_interval')
@@ -27,6 +29,27 @@ def vector(value, size, *, unit=False):
         number(x)
     if unit and not math.isclose(sum(x*x for x in value), 1, abs_tol=1e-5):
         raise ValueError('Axis/quaternion must have unit norm')
+
+
+def validate_local_point(point, kind):
+    """A rigid marker in the decoded physical subject EEF frame, in metres."""
+    if kind not in LOCAL_POINT_KINDS:
+        raise ValueError('local_point is only supported by position/distance primitives')
+    keys(point, ('frame', 'offset_m', 'provenance'))
+    if point['frame'] != 'subject_eef':
+        raise ValueError('local_point must use the decoded physical subject_eef frame')
+    vector(point['offset_m'], 3)
+    provenance = point['provenance']
+    keys(provenance, ('source', 'reference', 'sha256', 'rationale'))
+    if provenance['source'] not in ('known_geometry', 'manual'):
+        raise ValueError('A fixed local point requires known geometry or explicit manual provenance')
+    digest = provenance['sha256']
+    if not isinstance(digest, str) or len(digest) != 64 or set(digest)-set('0123456789abcdef'):
+        raise ValueError('Local point provenance needs a lowercase SHA256 source identity')
+    for key in ('reference', 'rationale'):
+        if not isinstance(provenance[key], str) or not provenance[key].strip():
+            raise ValueError('Local point source reference and geometric rationale required')
+    return point
 
 
 def validate_constraint(c, length=None):
@@ -54,7 +77,10 @@ def validate_constraint(c, length=None):
     if kind == 'window_direction_cone':
         required.update(('window_steps', 'minimum_window_steps', 'minimum_reference_progress_m', 'fallback_radius_m'))
     displacement = kind in ('axis_displacement_interval', 'angular_displacement_interval')
-    keys(p, required, ('anchor',) if displacement else ())
+    optional = (('anchor',) if displacement else ()) + (('local_point',) if kind in LOCAL_POINT_KINDS else ())
+    keys(p, required, optional)
+    if 'local_point' in p:
+        validate_local_point(p['local_point'], kind)
     if displacement and p.get('anchor', 'predicted_start') not in ('predicted_start', 'reference_frame'):
         raise ValueError('Displacement anchor must be predicted_start or reference_frame')
     for key in ('axis', 'local_axis', 'reference_axis'):
@@ -120,7 +146,7 @@ def validate_constraint(c, length=None):
 
 def validate_bundle(bundle, length=None):
     keys(bundle, ('schema_version', 'action_contract', 'provenance', 'constraints'))
-    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', '1.3', SCHEMA_VERSION):
+    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', '1.3', '1.4', SCHEMA_VERSION):
         raise ValueError('Unsupported embedded constraint schema')
     contract = bundle['action_contract']
     keys(contract, ('position', 'rotation', 'quaternion_order', 'gripper', 'frame'))
@@ -142,13 +168,15 @@ def validate_bundle(bundle, length=None):
         raise ValueError('constraints must be a list of conjunctive base constraints')
     ids = set()
     for c in bundle['constraints']:
-        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', '1.3', SCHEMA_VERSION):
+        if 'local_point' in c['parameters'] and bundle['schema_version'] != SCHEMA_VERSION:
+            raise ValueError('Rigid local point constraints require schema 1.5')
+        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', '1.3', '1.4', SCHEMA_VERSION):
             raise ValueError('Explicit displacement anchors require schema 1.2')
         if c['type'] == 'motion_direction_cone' and bundle['schema_version'] == '1.0':
             raise ValueError('Direction cones require schema 1.1')
-        if c['type'] == 'window_direction_cone' and bundle['schema_version'] not in ('1.3', SCHEMA_VERSION):
+        if c['type'] == 'window_direction_cone' and bundle['schema_version'] not in ('1.3', '1.4', SCHEMA_VERSION):
             raise ValueError('Window direction cones require schema 1.3')
-        if c['type'] == 'gripper_pair_max_interval' and bundle['schema_version'] != SCHEMA_VERSION:
+        if c['type'] == 'gripper_pair_max_interval' and bundle['schema_version'] not in ('1.4', SCHEMA_VERSION):
             raise ValueError('Joint gripper max constraints require schema 1.4')
         validate_constraint(c, length)
         if c['id'] in ids:
