@@ -183,6 +183,20 @@ python scripts/robotwin_acceptance_workflow.py --plan benchmarks/robotwin/c2r_ac
 python scripts/robotwin_acceptance_workflow.py --plan benchmarks/robotwin/c2r_acceptance_v2.plan.json
 ```
 
+If the user explicitly stops the current benchmark before 500 outcomes, pass
+`--benchmark-stop-receipt /absolute/new-run/benchmark_stop_receipt.json` to either
+command. The workflow does not stop processes itself or mark the benchmark
+complete. Its state must already be `stopped_by_user`. The receipt contains
+`version: 1`, `kind: "user_requested_benchmark_stop"`, the exact `benchmark_root`
+and `run_root`, `stopped_unix`, and SHA256 hashes of the benchmark's unchanged
+`summary.json` and `user_stop.json` in `summary_sha256` and
+`benchmark_stop_receipt_sha256`. The latter evidence file must repeat the same
+identity, stop time, and summary hash. A failed/running benchmark or mismatched
+hash is rejected. The workflow freezes the receipt content, source path and raw
+hash in `benchmark_release.json`, which also permits a verified restart without
+repeating the CLI flag. Check-only does not write this release. The frozen plan,
+incomplete benchmark results and all acceptance/training gates remain intact.
+
 The plan's code paths must point to isolated snapshots under the new run root.
 `state.json`, `acceptance_progress.json`, `acceptance_blocked.json`,
 `acceptance/<task>/<template>/`, `publication.log`, and

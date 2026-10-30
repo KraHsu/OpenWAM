@@ -1,5 +1,6 @@
 """A new run cannot overtake the benchmark or bypass failed acceptance."""
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -136,3 +137,98 @@ def test_terminal_resume_rejects_mismatched_training_identity(tmp_path):
     write(run.root/'training_plan.json', dict(p['training'], micro_batch=8))
     with pytest.raises(ValueError, match='matching frozen training plan'):
         run.run()
+
+
+def stopped_receipt(p):
+    benchmark = Path(p['benchmark_root'])
+    write(benchmark/'state.json', dict(phase='stopped_by_user'))
+    write(benchmark/'summary.json', dict(complete=False, completed_episodes=31))
+    receipt = dict(version=1, kind='user_requested_benchmark_stop', benchmark_root=p['benchmark_root'],
+                   run_root=p['run_root'], stopped_unix=1800000000,
+                   summary_sha256=hashlib.sha256((benchmark/'summary.json').read_bytes()).hexdigest())
+    write(benchmark/'user_stop.json', dict(receipt, owned_processes_stopped=True))
+    receipt['benchmark_stop_receipt_sha256'] = hashlib.sha256((benchmark/'user_stop.json').read_bytes()).hexdigest()
+    path = Path(p['run_root'])/'benchmark_stop_receipt.json'
+    write(path, receipt)
+    return path
+
+
+def test_explicit_user_stop_releases_dependency_without_claiming_completion(tmp_path, monkeypatch):
+    p = plan(tmp_path)
+    receipt_path = stopped_receipt(p)
+    assert not workflow.benchmark_complete(p['benchmark_root'], p['tasks'])
+    assert workflow.benchmark_stop_release(p) is None  # Presence alone is not authorization.
+    release = workflow.benchmark_stop_release(p, receipt_path)
+    assert release['receipt_sha256'] == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    assert not (Path(p['run_root'])/'benchmark_release.json').exists()
+    run = workflow.Workflow(p, benchmark_stop_receipt=receipt_path)
+    entered = []
+    monkeypatch.setattr(run, 'wait_idle', lambda: entered.append('wait_idle'))
+    def reach_acceptance():
+        entered.append('acceptance')
+        raise RuntimeError('test reached acceptance without waiting for 500')
+    monkeypatch.setattr(run, 'prepare_templates', reach_acceptance)
+    with pytest.raises(RuntimeError, match='reached acceptance'):
+        run.run()
+    assert entered == ['wait_idle', 'acceptance']
+    assert workflow.read(Path(p['run_root'])/'benchmark_release.json') == release
+    assert workflow.benchmark_stop_release(p) == release  # Explicit authorization survives restart.
+    assert workflow.read(Path(p['benchmark_root'])/'state.json')['phase'] == 'stopped_by_user'
+    assert workflow.read(Path(p['benchmark_root'])/'summary.json')['complete'] is False
+
+
+@pytest.mark.parametrize('field,value', [('run_root', '/different/run'),
+                                      ('benchmark_root', '/different/benchmark'),
+                                      ('summary_sha256', '0'*64),
+                                      ('benchmark_stop_receipt_sha256', '0'*64)])
+def test_stop_receipt_rejects_wrong_roots_and_hashes(tmp_path, field, value):
+    p = plan(tmp_path)
+    path = stopped_receipt(p)
+    receipt = workflow.read(path)
+    receipt[field] = value
+    write(path, receipt)
+    with pytest.raises(ValueError):
+        workflow.benchmark_stop_release(p, path)
+
+
+def test_stop_receipt_requires_actual_stop_state_and_matching_evidence(tmp_path):
+    p = plan(tmp_path)
+    path = stopped_receipt(p)
+    benchmark = Path(p['benchmark_root'])
+    write(benchmark/'state.json', dict(phase='failed'))
+    with pytest.raises(ValueError, match='stopped_by_user'):
+        workflow.benchmark_stop_release(p, path)
+    with pytest.raises(RuntimeError, match='failed'):
+        workflow.benchmark_complete(benchmark, p['tasks'])
+    write(benchmark/'state.json', dict(phase='stopped_by_user'))
+    raw = workflow.read(benchmark/'user_stop.json')
+    raw['stopped_unix'] += 1
+    write(benchmark/'user_stop.json', raw)
+    receipt = workflow.read(path)
+    receipt['benchmark_stop_receipt_sha256'] = hashlib.sha256((benchmark/'user_stop.json').read_bytes()).hexdigest()
+    write(path, receipt)
+    with pytest.raises(ValueError, match='differs in stopped_unix'):
+        workflow.benchmark_stop_release(p, path)
+
+
+def test_frozen_release_rejects_changed_receipt_even_when_reformatted(tmp_path):
+    p = plan(tmp_path)
+    path = stopped_receipt(p)
+    release = workflow.benchmark_stop_release(p, path)
+    workflow.bind(Path(p['run_root'])/'benchmark_release.json', release)
+    path.write_text(path.read_text()+'\n')
+    with pytest.raises(ValueError, match='Frozen benchmark release changed'):
+        workflow.benchmark_stop_release(p)
+
+
+def test_check_only_validates_stop_receipt_without_writing_release(tmp_path, monkeypatch, capsys):
+    p = plan(tmp_path)
+    receipt = stopped_receipt(p)
+    path = tmp_path/'plan.json'
+    write(path, p)
+    monkeypatch.setattr(workflow.sys, 'argv', ['workflow', '--plan', str(path), '--check-only',
+                                            '--benchmark-stop-receipt', str(receipt)])
+    workflow.main()
+    assert json.loads(capsys.readouterr().out) == dict(valid=True, benchmark_complete=False,
+                                                     benchmark_released_by_user=True)
+    assert not (Path(p['run_root'])/'benchmark_release.json').exists()

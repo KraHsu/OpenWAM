@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import queue
 import signal
@@ -71,6 +72,50 @@ def benchmark_complete(root, tasks):
     return True
 
 
+def benchmark_stop_release(plan, receipt_path=None):
+    """Validate an explicit user stop, or its previously frozen authorization.
+
+    A stopped benchmark remains incomplete. This changes only the dependency
+    release condition, with a durable receipt separate from the frozen plan.
+    Reading/check-only never creates a release file or changes benchmark state.
+    """
+    frozen_path = Path(plan['run_root']) / 'benchmark_release.json'
+    frozen = read(frozen_path) if frozen_path.exists() else None
+    if receipt_path is None:
+        if frozen is None:
+            return None
+        receipt_path = frozen['receipt_path']
+    receipt_path = Path(receipt_path).resolve()
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw)
+    if receipt.get('version') != 1 or receipt.get('kind') != 'user_requested_benchmark_stop':
+        raise ValueError('Expected an explicit user-requested benchmark stop receipt')
+    for key in ('benchmark_root', 'run_root'):
+        if not isinstance(receipt.get(key), str) or Path(receipt[key]).resolve() != Path(plan[key]).resolve():
+            raise ValueError(f'Benchmark stop receipt has mismatched {key}')
+    stopped = receipt.get('stopped_unix')
+    if type(stopped) not in (int, float) or not math.isfinite(stopped) or stopped <= 0:
+        raise ValueError('Benchmark stop receipt has invalid stop time')
+    benchmark = Path(plan['benchmark_root'])
+    if read(benchmark / 'state.json').get('phase') != 'stopped_by_user':
+        raise ValueError('Benchmark stop receipt requires state stopped_by_user')
+    summary_hash = hashlib.sha256((benchmark / 'summary.json').read_bytes()).hexdigest()
+    if receipt.get('summary_sha256') != summary_hash:
+        raise ValueError('Benchmark summary changed after the user stop')
+    stop_raw = (benchmark / 'user_stop.json').read_bytes()
+    if receipt.get('benchmark_stop_receipt_sha256') != hashlib.sha256(stop_raw).hexdigest():
+        raise ValueError('Benchmark user-stop evidence hash changed')
+    stop_evidence = json.loads(stop_raw)
+    for key in ('version', 'kind', 'benchmark_root', 'run_root', 'stopped_unix', 'summary_sha256'):
+        if stop_evidence.get(key) != receipt[key]:
+            raise ValueError(f'Benchmark user-stop evidence differs in {key}')
+    release = dict(version=1, receipt_path=str(receipt_path),
+                   receipt_sha256=hashlib.sha256(raw).hexdigest(), receipt=receipt)
+    if frozen is not None and frozen != release:
+        raise ValueError('Frozen benchmark release changed')
+    return release
+
+
 def validate_plan(plan):
     if plan.get('version') != 1 or len(set(plan['tasks'])) != 50:
         raise ValueError('Expected a versioned 50-task workflow plan')
@@ -105,12 +150,13 @@ def selected_gpu_jobs(gpus):
 
 
 class Workflow:
-    def __init__(self, plan):
+    def __init__(self, plan, benchmark_stop_receipt=None):
         validate_plan(plan)
         self.plan, self.root = plan, Path(plan['run_root'])
         self.root.mkdir(parents=True, exist_ok=True)
         self.stop = threading.Event()
         self.registry = self.root / 'registry'
+        self.benchmark_stop_receipt = benchmark_stop_receipt
         sys.path.insert(0, plan['rax_root'])
 
     def state(self, phase, **extra):
@@ -268,7 +314,11 @@ class Workflow:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: self.stop.set())
             try:
-                while not benchmark_complete(self.plan['benchmark_root'], self.plan['tasks']):
+                release = benchmark_stop_release(self.plan, self.benchmark_stop_receipt)
+                if release is not None:
+                    bind(self.root / 'benchmark_release.json', release)
+                    self.state('benchmark_released_by_user', receipt_sha256=release['receipt_sha256'])
+                while release is None and not benchmark_complete(self.plan['benchmark_root'], self.plan['tasks']):
                     self.state('waiting_for_benchmark', benchmark_root=self.plan['benchmark_root'])
                     if self.stop.wait(self.plan['poll_seconds']):
                         raise RuntimeError('Workflow interrupted')
@@ -311,13 +361,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true')
+    parser.add_argument('--benchmark-stop-receipt', type=Path,
+                        help='Explicit user-stop evidence; never marks an incomplete benchmark complete')
     args = parser.parse_args()
     plan = read(args.plan)
     validate_plan(plan)
     if args.check_only:
-        print(json.dumps(dict(valid=True, benchmark_complete=benchmark_complete(plan['benchmark_root'], plan['tasks']))))
+        release = benchmark_stop_release(plan, args.benchmark_stop_receipt)
+        complete = False if release is not None else benchmark_complete(plan['benchmark_root'], plan['tasks'])
+        print(json.dumps(dict(valid=True, benchmark_complete=complete, benchmark_released_by_user=release is not None)))
     else:
-        Workflow(plan).run()
+        Workflow(plan, benchmark_stop_receipt=args.benchmark_stop_receipt).run()
 
 
 if __name__ == '__main__':
