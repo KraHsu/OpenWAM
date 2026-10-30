@@ -66,6 +66,23 @@ def rows_to_trajectory(rows):
             for arm, offset in (('left', 0), ('right', 8))}
 
 
+def ground_instruction_info(task, native, *, readonly_reader, expert, fingerprint, expected_scene):
+    """Prefer audited initial-scene fields; isolate legacy expert fallback."""
+    before = fingerprint(native)
+    if before != expected_scene:
+        raise ValueError('Instruction scene differs from frozen reference')
+    metadata = readonly_reader(task, native)
+    if metadata is not None:
+        if fingerprint(native) != before:
+            raise ValueError('Read-only instruction metadata changed the scene')
+        return metadata['info'], dict(metadata['provenance'], scene_before=before, scene_after=before)
+    info = expert(native)
+    if not native.plan_success or not native.check_success():
+        raise ValueError('Frozen reference expert cannot ground scene-specific instruction')
+    return info['info'], {'adapter': 'isolated_expert_then_scene_reset', 'expert_actions_for_instruction': True,
+                          'scene_before': before}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--reference', type=Path, required=True)
@@ -85,6 +102,7 @@ def main():
     )
     from services.robotwin.collection import initial_scene, install_planner_cache, scene_fingerprint
     from services.robotwin.runtime import initialize_runtime, native_config, source_commit
+    from services.robotwin.instruction_metadata import readonly_instruction_metadata
     from scripts.collect_robotwin_clean50 import play_expert
     from benchmarks.robotwin.openwam2robotwin_interface import ModelClient, _extract_eef_proprio
 
@@ -136,13 +154,14 @@ def main():
             native.close_env(); raise
     native = factory()
     try:
-        info = play_expert(native)
-        if not native.plan_success or not native.check_success():
-            raise ValueError('Frozen reference expert cannot ground scene-specific instruction')
+        info, metadata_provenance = ground_instruction_info(
+            task, native, readonly_reader=readonly_instruction_metadata, expert=play_expert,
+            fingerprint=lambda env: scene_fingerprint(initial_scene(env)), expected_scene=ref['provenance']['scene_sha256'])
         random.seed(seed)
-        texts = generate_episode_descriptions(task, [info['info']], 1)[0]['unseen']
+        texts = generate_episode_descriptions(task, [info], 1)[0]['unseen']
         instruction = random.Random(seed).choice(texts)
-        put(output/'instruction.json', dict(instruction=instruction, kind='unseen', scene_info=info['info']))
+        put(output/'instruction.json', dict(instruction=instruction, kind='unseen', scene_info=info,
+                                           metadata_provenance=metadata_provenance))
     finally:
         native.close_env()
     native = factory()
