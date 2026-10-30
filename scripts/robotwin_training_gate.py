@@ -284,6 +284,8 @@ def run_gate(plan_path):
             subprocess.run(args, cwd=plan['openwam_root'], env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
 
     try:
+        from scripts.robotwin_acceptance_workflow import check_publication_hold
+        check_publication_hold(root.parent)
         while True:
             plan = json.loads(plan_path.read_text())
             accum = validate_plan(plan)
@@ -297,8 +299,11 @@ def run_gate(plan_path):
         python = plan['python']
         if plan.get('require_acceptance_v2'):
             state('validating_counterfactual_publication')
-            execute([python, str(Path(plan['rax_root'])/'scripts/publish_robotwin_constraint_dataset.py'),
-                     '--validate-only', '--output', plan['dataset_root']], 'acceptance_publication_audit.log')
+            command = [python, str(Path(plan['rax_root'])/'scripts/publish_robotwin_constraint_dataset.py'),
+                       '--validate-only', '--output', plan['dataset_root']]
+            if plan.get('require_constraint_refinement'):
+                command.append('--require-refinement')
+            execute(command, 'acceptance_publication_audit.log')
         state('freeze')
         if plan.get('published_dataset_is_snapshot'):
             # The v2 publisher has already copied every recording to a new
@@ -356,6 +361,7 @@ def run_gate(plan_path):
             raise ValueError('Resumed action model weights did not update')
         atomic_json(root/'smoke_passed.json', {'passed': True, 'metrics': metrics, 'world_size': len(plan['gpus']),
                                              'global_batch': 256, 'resume_tested': True})
+        check_publication_hold(root.parent)
         state('training', config=str(root/'train.yaml'), epochs=5, global_batch=256,
               world_size=len(plan['gpus']), micro_batch=plan['micro_batch'], gradient_accumulation_steps=accum)
         execute(launch+['--config-name=train'], 'training.log', cuda=cuda)

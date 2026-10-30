@@ -53,6 +53,18 @@ def bind(path, value):
         write(path, value)
 
 
+def check_publication_hold(root):
+    """An explicit research hold prevents old pilot evidence releasing training."""
+    path = Path(root) / 'publication_hold.json'
+    if not path.exists():
+        return
+    hold = read(path)
+    if hold.get('version') != 1 or type(hold.get('active')) is not bool:
+        raise ValueError('Invalid publication hold; inspect before publishing')
+    if hold['active']:
+        raise RuntimeError('Publication/training held: ' + str(hold.get('reason', 'additional validation required')))
+
+
 def benchmark_complete(root, tasks):
     root = Path(root)
     if not (root / 'state.json').exists():
@@ -141,6 +153,8 @@ def validate_plan(plan):
         raise ValueError('New training must require acceptance-v2 publication proof')
     if plan['training'].get('published_dataset_is_snapshot') is not True:
         raise ValueError('New training must use the accepted publication as its frozen snapshot')
+    if plan.get('require_constraint_refinement') and not plan['training'].get('require_constraint_refinement'):
+        raise ValueError('Constraint refinement evidence must also be required by training')
     if not set(plan['pilot_tasks']).issubset(plan['tasks']) or not plan['pilot_tasks']:
         raise ValueError('Explicit pilot tasks required')
 
@@ -331,14 +345,18 @@ class Workflow:
                 remaining = [job for job in jobs if job not in pilot]
                 self.state('acceptance', templates=len(remaining))
                 self.validate_jobs(remaining)
+                check_publication_hold(self.root)
                 self.state('publishing_new_dataset')
                 command = [self.plan['python'], str(Path(self.plan['rax_root']) /
                            'scripts/publish_robotwin_constraint_dataset.py'), '--source-root',
                            self.plan['source_dataset_root'], '--registry-root', str(self.registry),
                            '--output', self.plan['training']['dataset_root']]
+                if self.plan.get('require_constraint_refinement'):
+                    command.append('--require-refinement')
                 if self.execute(command, self.root / 'publication.log'):
                     raise RuntimeError('Dataset publication failed; training withheld')
                 self.wait_idle()
+                check_publication_hold(self.root)
                 train_plan = self.root / 'training_plan.json'
                 bind(train_plan, self.plan['training'])
                 self.state('training_gate')

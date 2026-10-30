@@ -67,6 +67,15 @@ def test_new_paths_and_acceptance_are_mandatory(tmp_path):
         validate_training_plan(p['training'])
 
 
+def test_refinement_required_by_workflow_cannot_disappear_at_training(tmp_path):
+    p = plan(tmp_path)
+    p['require_constraint_refinement'] = True
+    with pytest.raises(ValueError, match='refinement'):
+        workflow.validate_plan(p)
+    p['training']['require_constraint_refinement'] = True
+    workflow.validate_plan(p)
+
+
 def test_plan_changes_cannot_silently_resume_existing_workflow(tmp_path):
     p = tmp_path/'resolved.json'
     workflow.bind(p, dict(weight=.1))
@@ -232,3 +241,15 @@ def test_check_only_validates_stop_receipt_without_writing_release(tmp_path, mon
     assert json.loads(capsys.readouterr().out) == dict(valid=True, benchmark_complete=False,
                                                      benchmark_released_by_user=True)
     assert not (Path(p['run_root'])/'benchmark_release.json').exists()
+
+
+def test_research_publication_hold_is_fail_closed(tmp_path):
+    workflow.check_publication_hold(tmp_path)
+    workflow.write(tmp_path/'publication_hold.json', {'version': 1, 'active': True, 'reason': 'Need model-aware counterexamples'})
+    with pytest.raises(RuntimeError, match='model-aware'):
+        workflow.check_publication_hold(tmp_path)
+    workflow.write(tmp_path/'publication_hold.json', {'version': 1, 'active': 'false'})
+    with pytest.raises(ValueError, match='Invalid publication hold'):
+        workflow.check_publication_hold(tmp_path)
+    workflow.write(tmp_path/'publication_hold.json', {'version': 1, 'active': False})
+    workflow.check_publication_hold(tmp_path)
