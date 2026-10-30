@@ -1,5 +1,6 @@
 import json
-from pathlib import Path
+import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +8,7 @@ from scripts.robotwin_training_gate import (
     check_smoke, copy_snapshot, expected_training_steps, publication_status,
     selected_checkpoint, training_command, validate_plan,
 )
+from scripts import robotwin_training_gate as gate
 
 
 def test_batch_is_global_and_accumulation_is_exact():
@@ -34,6 +36,30 @@ def test_four_gpu_launch_and_five_epoch_completion_use_actual_world_size():
     assert '--nproc-per-node=8' not in command
     assert expected_training_steps(549998, plan) == 42970
     assert expected_training_steps(549998, dict(plan, gpus=list(range(8)))) == 21485
+
+
+def test_gpu_wait_only_considers_reserved_devices_and_rejects_missing_device(monkeypatch):
+    def query(command, **kwargs):
+        if '--query-gpu=index,uuid' in command:
+            return SimpleNamespace(stdout='0, GPU-A\n1, GPU-B\n4, GPU-E\n')
+        return SimpleNamespace(stdout='111, GPU-A, our-device-busy\n222, GPU-E, unrelated-job\n')
+    monkeypatch.setattr(gate.subprocess, 'run', query)
+    assert gate.gpu_processes([0, 1]) == ['111, GPU-A, our-device-busy']
+    assert gate.gpu_processes([1]) == []
+    with pytest.raises(ValueError, match='unavailable'):
+        gate.gpu_processes([2])
+
+
+def test_child_import_path_binds_frozen_code_before_inherited_environment(tmp_path, monkeypatch):
+    plan = dict(openwam_root=str(tmp_path/'new/OpenWAM'), rax_root=str(tmp_path/'new/rax'))
+    monkeypatch.setenv('PYTHONPATH', '/old/editable:/other/library')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '4,5,6,7')
+    env = gate.execution_environment(plan, cuda='0,1,2,3')
+    assert env['PYTHONPATH'].split(os.pathsep) == [plan['openwam_root'], plan['rax_root'],
+                                                   '/old/editable', '/other/library']
+    assert env['CUDA_VISIBLE_DEVICES'] == '0,1,2,3'
+    assert gate.execution_environment(plan)['CUDA_VISIBLE_DEVICES'] == ''
+    assert os.environ['CUDA_VISIBLE_DEVICES'] == '4,5,6,7'
 
 
 def test_publication_requires_each_task_and_completed_annotation(tmp_path):

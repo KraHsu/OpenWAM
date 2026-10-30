@@ -139,3 +139,61 @@ snapshot with a visible disconnected notice and its timestamp.
 The local launch record and log for the current session are under
 `../artifacts/c2r_evaluation/progress_monitor/`. CPU checks for progress aggregation
 and disconnect handling are in `tests/test_c2r_progress.py`.
+
+
+## Following run: counterfactual acceptance and new training
+
+`robotwin_acceptance_workflow.py` uses `c2r_acceptance_v2.plan.json` to wait for
+all 500 outcomes in the current benchmark. The next run has its own source
+snapshots, registry, evidence, dataset and training directory. It reads the old
+benchmark and 2,500 clean recordings without changing them. It waits for the
+selected GPUs to become idle and never terminates unrelated work.
+
+Each template actually needed by the 50 × 50 recordings must pass the new
+acceptance protocol on held-out **clean** scenes. The initial pilot covers
+`adjust_bottle`, `beat_block_hammer`, and `lift_pot`. Each template receives
+three distinct scenes, two repeated baseline replays per scene, and position,
+orientation, gripper-timing and coupled perturbations. Raw measured trajectories,
+commands, native task outcomes and hashes remain available for independent
+reassessment. Planning failures, incomplete trajectories and interventions not
+realized by the robot do not count as task negatives.
+
+The frozen pilot requires successful variations on every held-out scene, at
+least six genuine task failures spanning at least two perturbation families,
+zero accepted failures, and no more than 20% rejected successful variations.
+This is evidence about these finite cases, not a proof that every constraint-
+satisfying action succeeds. All planned outcomes are retained. A failed pilot
+or template blocks publication and training; the workflow does not relax its
+thresholds or silently revert to legacy labels. Repair requires reviewing the
+recorded counterexamples and making a new version of the affected experiment.
+
+When every used template passes, the publisher creates separate-inode copies
+of all 2,500 recordings and embeds the accepted constraints and their proof.
+The original actions, images, instructions and distinct clean initial states
+are retained; random evaluation rollouts are never training data. The new
+dataset appears atomically only after its labels, hashes and evidence validate.
+Training revalidates the publication, audits the complete dataset, checks actual
+action decoding and gradients, and runs one optimizer-step smoke test plus a
+resume smoke test before starting five epochs with global batch 256 on four
+H200s. It starts from the same Foundation checkpoint as the previous experiment.
+The published dataset itself is the sealed training snapshot.
+
+```bash
+python scripts/robotwin_acceptance_workflow.py --plan benchmarks/robotwin/c2r_acceptance_v2.plan.json --check-only
+python scripts/robotwin_acceptance_workflow.py --plan benchmarks/robotwin/c2r_acceptance_v2.plan.json
+```
+
+The plan's code paths must point to isolated snapshots under the new run root.
+`state.json`, `acceptance_progress.json`, `acceptance_blocked.json`,
+`acceptance/<task>/<template>/`, `publication.log`, and
+`training_run/state.json` identify the phase and any blocking evidence. A file
+lock prevents duplicate workflows. Resource guardians close only this
+workflow's children when its launcher exits. Re-running a completed workflow
+does not start a second training; interrupted training requires inspection.
+
+Code changes, rule checks, evidence reassessment and dataset publication use
+CPU. Actual native counterfactual replay needs simulator GPU access. As of
+2026-10-30, the prior same-size training took 141h 45m; the next training budget
+is 142–156h. A provisional 24–48h acceptance budget must be calibrated by the
+first native pilot. It is not measured throughput and excludes unknown template
+repair cycles. A new model C2R benchmark is a separate step after training.

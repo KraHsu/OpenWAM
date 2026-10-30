@@ -38,6 +38,8 @@ def publication_status(root):
 
 
 def validate_plan(plan):
+    if plan.get('published_dataset_is_snapshot') and not plan.get('require_acceptance_v2'):
+        raise ValueError('Reusing a publication as the frozen snapshot requires acceptance-v2 proof')
     if plan['num_epochs'] != 5 or plan['global_batch'] != 256:
         raise ValueError('This experiment was requested as 5 epochs / global batch 256')
     gpus = plan['gpus']
@@ -60,6 +62,16 @@ def training_command(plan, root):
     validate_plan(plan)
     return [plan['python'], '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
             f"--nproc-per-node={len(plan['gpus'])}", 'scripts/train.py', '--config-path', str(root)]
+
+
+def execution_environment(plan, *, cuda=''):
+    """Pin child imports to this run's code before any inherited editable path."""
+    paths = [str(Path(plan[key]).resolve()) for key in ('openwam_root', 'rax_root')]
+    if os.environ.get('PYTHONPATH'):
+        paths.append(os.environ['PYTHONPATH'])
+    return dict(os.environ, CUDA_VISIBLE_DEVICES=cuda, PYTHONPATH=os.pathsep.join(paths),
+                OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2', WANDB_MODE='disabled',
+                HYDRA_FULL_ERROR='1', NCCL_DEBUG='WARN', PYTHONUNBUFFERED='1', USE_TF='0', USE_FLAX='0')
 
 
 def selected_checkpoint(plan):
@@ -105,6 +117,9 @@ def make_config(plan, snapshot, checkpoint):
     cfg.training.constraints.weight = plan.get('constraint_weight', .1)
     cfg.training.constraints.execution_horizon = None
     cfg.training.constraints.require_full_coverage = True
+    cfg.training.constraints.timestep_strategy = plan.get('constraint_timestep_strategy', 'clean')
+    cfg.training.constraints.sigma_floor = plan.get('constraint_sigma_floor', .05)
+    cfg.training.constraints.penalty_scale_overrides = plan.get('constraint_penalty_scale_overrides', {})
     cfg.training.finetune_ckpt_path = checkpoint
     cfg.training.output_path = str(Path(plan['run_root'])/'training')
     cfg.training.save_steps = plan.get('save_steps', 2000)
@@ -196,13 +211,25 @@ def copy_snapshot(source, target):
                 h.update(block)
         inventory.append({'path': str(relative), 'sha256': h.hexdigest(), 'bytes': dest.stat().st_size})
     shutil.copy2(source/'batch_manifest.json', target/'batch_manifest.json')
+    if (source/'acceptance_manifest.json').exists():
+        shutil.copy2(source/'acceptance_manifest.json', target/'acceptance_manifest.json')
     atomic_json(target/'snapshot_complete.json', {'source': str(source), 'files': inventory})
 
 
-def gpu_processes():
+def gpu_processes(gpus):
+    """Only selected devices can block this run; reject missing device indices."""
+    mapping = subprocess.run(['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'],
+                             check=True, capture_output=True, text=True, timeout=30)
+    devices = {int(row.split(',')[0].strip()): row.split(',')[1].strip()
+               for row in mapping.stdout.splitlines() if row.strip()}
+    missing = set(gpus)-devices.keys()
+    if missing:
+        raise ValueError(f'Selected GPU indices are unavailable: {sorted(missing)}')
+    selected = {devices[index] for index in gpus}
     result = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,gpu_uuid,process_name', '--format=csv,noheader'],
                             check=True, capture_output=True, text=True, timeout=30)
-    return [line for line in result.stdout.splitlines() if line.strip()]
+    return [line for line in result.stdout.splitlines()
+            if line.strip() and line.split(',')[1].strip() in selected]
 
 
 def check_smoke(run, accum, *, resumed=False):
@@ -252,9 +279,7 @@ def run_gate(plan_path):
         atomic_json(state_path, dict(phase=phase, pid=os.getpid(), updated_unix=time.time(), **extra))
 
     def execute(args, log, *, cuda=''):
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=cuda, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',
-                   WANDB_MODE='disabled', HYDRA_FULL_ERROR='1', NCCL_DEBUG='WARN', PYTHONUNBUFFERED='1',
-                   USE_TF='0', USE_FLAX='0')
+        env = execution_environment(plan, cuda=cuda)
         with (root/log).open('a') as stream:
             subprocess.run(args, cwd=plan['openwam_root'], env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
 
@@ -270,9 +295,24 @@ def run_gate(plan_path):
             time.sleep(30)
         atomic_json(root/'resolved_plan.json', dict(plan, initial_checkpoint=checkpoint, gradient_accumulation_steps=accum))
         python = plan['python']
+        if plan.get('require_acceptance_v2'):
+            state('validating_counterfactual_publication')
+            execute([python, str(Path(plan['rax_root'])/'scripts/publish_robotwin_constraint_dataset.py'),
+                     '--validate-only', '--output', plan['dataset_root']], 'acceptance_publication_audit.log')
         state('freeze')
-        snapshot = root/'dataset'
-        copy_snapshot(Path(plan['dataset_root']), snapshot)
+        if plan.get('published_dataset_is_snapshot'):
+            # The v2 publisher has already copied every recording to a new
+            # inode and sealed all file hashes/proofs. Bind that versioned
+            # snapshot rather than make a second copy that drops its proofs.
+            snapshot = Path(plan['dataset_root']).resolve()
+            atomic_json(root/'dataset_binding.json', {
+                'path': str(snapshot), 'acceptance_version': 2,
+                'acceptance_manifest_sha256': hashlib.sha256((snapshot/'acceptance_manifest.json').read_bytes()).hexdigest(),
+                'snapshot_sha256': hashlib.sha256((snapshot/'snapshot_complete.json').read_bytes()).hexdigest(),
+            })
+        else:
+            snapshot = root/'dataset'
+            copy_snapshot(Path(plan['dataset_root']), snapshot)
         state('audit')
         execute([python, 'scripts/audit_robotwin_constraints.py', '--root', str(snapshot), '--rax-root', plan['rax_root'],
                  '--output', str(root/'final_audit.json'), '--workers', '4', '--all-images', '--require-complete'], 'audit.log')
@@ -282,7 +322,7 @@ def run_gate(plan_path):
         execute([python, 'scripts/robotwin_training_gate.py', '--prepare-data', str(root/'train.yaml'),
                  '--report', str(root/'reader_audit.json')], 'reader_audit.log')
         while True:
-            busy = gpu_processes()
+            busy = gpu_processes(plan['gpus'])
             if not busy:
                 break
             state('waiting_for_gpus', processes=busy)
