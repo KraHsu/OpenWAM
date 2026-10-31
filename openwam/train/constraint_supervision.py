@@ -16,7 +16,7 @@ import torch
 from openwam.train.constraint_calibration import timestep_factors
 from openwam.train.constraint_coverage import chunk_candidate, coverage_report
 from openwam.train.constraint_schema import canonical_json, number, validate_bundle
-from openwam.train.meta_constraints import penalty, residual
+from openwam.train.meta_constraints import ANGLE_CENTER_POLICIES, penalty, residual
 
 SIGMA_BINS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
@@ -60,8 +60,17 @@ class ActionDecoder:
 
 class RoboTwinConstraintObjective:
     def __init__(self, dataset, dataset_root, *, weight, execution_horizon=None, require_full_coverage=True,
-                 timestep_strategy='clean', sigma_floor=0.05, penalty_scale_overrides=None):
+                 timestep_strategy='clean', sigma_floor=0.05, penalty_scale_overrides=None,
+                 angle_center_backward='legacy', angle_center_log_per_constraint=True):
         self.weight = number(weight, positive=True)
+        if angle_center_backward not in ANGLE_CENTER_POLICIES:
+            raise ValueError('Unknown angular-center backward policy')
+        self.angle_center_backward = angle_center_backward
+        if type(angle_center_log_per_constraint) is not bool:
+            raise ValueError('angle_center_log_per_constraint must be boolean')
+        self.angle_center_log_per_constraint = angle_center_log_per_constraint
+        self.angle_center_metric_keys, self.angle_center_metric_catalog = {}, {}
+        self.angle_center_hint_constraints = 0
         if timestep_strategy not in ('clean', 'fm_matched'):
             raise ValueError('timestep_strategy must be clean or fm_matched')
         self.timestep_strategy = timestep_strategy
@@ -101,6 +110,15 @@ class RoboTwinConstraintObjective:
                         status_counts[c['evidence']['status']] += 1
                         source_counts[c['evidence']['source']] += 1
                         if c['evidence']['status'] == 'accepted':
+                            if c['type']=='axis_angle_interval' and c['parameters']['bounds'][0]>0:
+                                if angle_center_backward=='fixed_annotation_v1' and 'center_tangent_hint' not in c['parameters']:
+                                    raise ValueError(f'Positive-lower angular constraint {c["id"]} lacks its fixed annotation tangent; regenerate explicitly, never infer one from a chunk')
+                                self.angle_center_hint_constraints += int('center_tangent_hint' in c['parameters'])
+                                if angle_center_backward!='legacy' and angle_center_log_per_constraint:
+                                    identity=dict(episode=path.relative_to(root).as_posix(),constraint_id=c['id'])
+                                    key='angle_center_c_'+hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
+                                    self.angle_center_metric_keys[(str(path),c['id'])]=key
+                                    self.angle_center_metric_catalog[key]=identity
                             constraints.append(c)
                     archived.append({'episode': path.relative_to(root).as_posix(), 'bundle': bundle})
                 report = coverage_report(constraints, length)
@@ -119,7 +137,7 @@ class RoboTwinConstraintObjective:
     def provenance(self):
         decoders = sorted({json.dumps({'indices': d.indices, 'scale': d.divisor.tolist(), 'offset': d.offset.tolist()},
                                        sort_keys=True) for d, _, _, _ in self.episodes.values()})
-        return {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
+        result = {'embedded_constraints_sha256': self.store.sha256, 'weight': self.weight,
                 'matched_constraints': self.matched_constraints, 'status_counts': dict(self.store.status_counts),
                 'source_counts': dict(self.store.source_counts), 'objective_version': 'meta_intervals_v5_rigid_local_point',
                 'timestep_strategy': self.timestep_strategy, 'sigma_floor': self.sigma_floor,
@@ -129,6 +147,17 @@ class RoboTwinConstraintObjective:
                 'fully_covered_episodes': sum(r['complete'] for r in self.coverage.values()),
                 'execution_horizon': self.execution_horizon, 'gradient_entry': 'single_step_clean_action_estimate',
                 'decoder_sha256': hashlib.sha256(json.dumps(decoders).encode()).hexdigest()}
+        if self.angle_center_backward != 'legacy':
+            result.update(objective_version='meta_intervals_v6_fixed_angular_center',
+                angle_center_backward=dict(policy=self.angle_center_backward,
+                    selection='exact_cross_zero_dot_positive_and_lower_positive',
+                    invalid_hint='reject_before_training; no world-axis fallback',
+                    hint_constraints=self.angle_center_hint_constraints,
+                    log_per_constraint=self.angle_center_log_per_constraint,
+                    contribution_metric_catalog=self.angle_center_metric_catalog,
+                    source_sha256={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                        for name in ('meta_constraints.py','constraint_schema.py','action_trajectory.py','constraint_supervision.py')}))
+        return result
 
     def save_provenance(self, output_path):
         output = Path(output_path)
@@ -182,6 +211,13 @@ class RoboTwinConstraintObjective:
             bin_losses = [zero.clone() for _ in range(len(SIGMA_BINS)-1)]
             bin_weights = [0.0 for _ in bin_losses]
             bin_counts = [0 for _ in bin_losses]
+            center_metrics = {name:zero.clone() for name in ('angle_center_hit_count',
+                'angle_center_hint_frame_count','angle_center_invalid_hint_count')}
+            center_contributions = zero.clone()
+            # Fixed dataset-wide keys keep DDP metric columns aligned across
+            # ranks with different active chunks. Inactive entries are zero;
+            # updates below are out of place, so the shared zero is not mutated.
+            center_constraint_contributions = {key:zero for key in self.angle_center_metric_catalog}
             for sample_index, (prediction, (decoder, constraints, convention, _, sample)) in enumerate(
                     zip(clean_actions, entries, strict=True)):
                 if not constraints:
@@ -199,7 +235,8 @@ class RoboTwinConstraintObjective:
                 ref = decoder.decode(torch.cat((initial, reference[:h])))
                 valid = torch.cat((state_mask, mask[:h]))[:, decoder.indices]
                 for c in constraints:
-                    v = residual(physical, ref, valid, c, start_frame=int(sample['start_frame']), rotation_convention=convention)
+                    v = residual(physical, ref, valid, c, start_frame=int(sample['start_frame']), rotation_convention=convention,
+                                 angle_center_backward=self.angle_center_backward,diagnostics=center_metrics)
                     if v is None:
                         continue
                     w = c['penalty']['weight']
@@ -209,6 +246,11 @@ class RoboTwinConstraintObjective:
                         spec['scale'] = self.penalty_scale_overrides[kind]
                     raw_loss = w*penalty(v, spec)
                     weighted_loss = factors[sample_index]*raw_loss
+                    if self.angle_center_backward=='fixed_annotation_v1' and c['type']=='axis_angle_interval' and c['parameters']['bounds'][0]>0:
+                        center_contributions += weighted_loss.detach()
+                        key=self.angle_center_metric_keys.get((str(Path(sample['episode_path']).resolve()),c['id']))
+                        if key is not None:
+                            center_constraint_contributions[key]=center_constraint_contributions[key]+weighted_loss.detach()
                     losses.append(weighted_loss)
                     weights.append(w)
                     violations[kind].append(v.detach())
@@ -230,6 +272,9 @@ class RoboTwinConstraintObjective:
             loss = self.weight*numerator*world_size/denominator.clamp_min(1e-12)
             metrics = {'constraint_count': zero.new_tensor(float(len(losses))),
                        'constraint_weight_sum': local_weight, 'constraint_objective_weight': zero.new_tensor(self.weight)}
+            if self.angle_center_backward!='legacy':
+                metrics.update(center_metrics,angle_center_policy_penalty_sum=center_contributions)
+                metrics.update({key+'_penalty_sum':value for key,value in center_constraint_contributions.items()})
             for kind in KINDS:
                 v = torch.cat(violations[kind]) if violations[kind] else clean_actions.new_empty(0)
                 metrics.update({f'{kind}_count': v.new_tensor(float(v.numel())), f'{kind}_residual_sum': v.sum(),
@@ -267,7 +312,9 @@ def build_constraint_objective(cfg, dataset):
                                        require_full_coverage=settings.get('require_full_coverage', True),
                                        timestep_strategy=settings.get('timestep_strategy', 'clean'),
                                        sigma_floor=settings.get('sigma_floor', 0.05),
-                                       penalty_scale_overrides=settings.get('penalty_scale_overrides', {}))
+                                       penalty_scale_overrides=settings.get('penalty_scale_overrides', {}),
+                                       angle_center_backward=settings.get('angle_center_backward','legacy'),
+                                       angle_center_log_per_constraint=settings.get('angle_center_log_per_constraint',True))
 
 
 def validate_constraint_resume(output_path, objective):
@@ -301,6 +348,14 @@ def reduce_constraint_metrics(accelerator, losses):
     objective_weight = values[:, names.index('constraint_objective_weight')].mean().item() if 'constraint_objective_weight' in names else 1.0
     weight_sum = totals.get('constraint_weight_sum', 0.0)
     denominator = max(weight_sum, 1e-12)
+    for name in ('angle_center_hit_count','angle_center_hint_frame_count','angle_center_invalid_hint_count'):
+        if name in totals:
+            report[name]=totals[name]
+    if 'angle_center_policy_penalty_sum' in totals:
+        report['angle_center_policy_loss_contribution']=objective_weight*totals['angle_center_policy_penalty_sum']/denominator
+    for name,value in totals.items():
+        if name.startswith('angle_center_c_') and name.endswith('_penalty_sum'):
+            report[name.removesuffix('_penalty_sum')+'_loss_contribution']=objective_weight*value/denominator
     for kind in sorted(name.removesuffix("_residual_sum") for name in totals if name.endswith("_residual_sum")):
         count = totals[f"{kind}_count"]
         report[f"{kind}_count"] = count
