@@ -1,8 +1,9 @@
 """Portable embedded-data contract, shared verbatim with RAX. Standard library only."""
+import hashlib
 import json
 import math
 
-SCHEMA_VERSION = '1.5'
+SCHEMA_VERSION = '1.6'
 HDF5_KEY = 'trajectory_constraints/json'
 LOCAL_POINT_KINDS = ('axis_position_interval', 'radial_distance_interval',
                      'point_distance_interval', 'axis_displacement_interval')
@@ -52,6 +53,100 @@ def validate_local_point(point, kind):
     return point
 
 
+def _normalized_quaternion(value):
+    """Physical WXYZ, matching reader normalization, with a canonical sign."""
+    vector(value, 4)
+    q = [float(x) for x in value]
+    norm = math.sqrt(sum(x*x for x in q))
+    if not math.isclose(norm, 1., abs_tol=1e-4, rel_tol=1e-5):
+        raise ValueError('Angular-center reference quaternion is not measured unit WXYZ')
+    q = [x/norm for x in q]
+    sign = next((1 if x > 0 else -1 for x in q if x != 0), 1)
+    return [x*sign for x in q]
+
+
+def _rotate_vector(q, v, transpose=False):
+    w,x,y,z = _normalized_quaternion(q)
+    matrix = [[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+              [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+              [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]]
+    if transpose:
+        matrix = list(zip(*matrix))
+    return [sum(a*b for a,b in zip(row,v)) for row in matrix]
+
+
+def _hint_payload(c, source):
+    return dict(subject=c['subject'], reference_frame=c['reference_frame'],
+                local_axis=c['parameters']['local_axis'], reference_axis=c['parameters']['reference_axis'],
+                source={k:v for k,v in source.items() if k != 'sha256'})
+
+
+def _project_reference_axis(c, quaternion):
+    p = c['parameters']
+    axis = _rotate_vector(quaternion, p['local_axis'])
+    axis = _rotate_vector(c['reference_frame']['quaternion_wxyz'], axis, transpose=True)
+    target = p['reference_axis']; dot = sum(a*b for a,b in zip(axis,target))/sum(v*v for v in target)
+    tangent = [a-dot*b for a,b in zip(axis,target)]
+    norm = math.sqrt(sum(x*x for x in tangent))
+    # This is an annotation validity threshold, NOT a predicted near-center
+    # region with a substituted derivative. Never guess a world direction.
+    if norm <= 1e-8:
+        raise ValueError('Reference axis cannot determine a nondegenerate angular-center tangent')
+    return [x/norm for x in tangent]
+
+
+def make_center_tangent_hint(c, quaternion_wxyz, recording_id, frame):
+    """Fixed annotation only. Does not inspect a predicted chunk or alter bounds."""
+    q = [float(x) for x in quaternion_wxyz]
+    _normalized_quaternion(q)  # Validate; retain raw measured values in source identity.
+    sign = next((1 if x > 0 else -1 for x in q if x != 0), 1)
+    source = dict(kind='reference_axis_projection', recording_id=recording_id, frame=frame,
+                  quaternion_wxyz=[x*sign for x in q])
+    source['sha256'] = hashlib.sha256(json.dumps(_hint_payload(c,source),sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    hint = dict(version=1, frame='reference', direction=_project_reference_axis(c,source['quaternion_wxyz']),source=source)
+    return hint
+
+
+def validate_center_tangent_hint(c, *, length=None):
+    if c['type'] != 'axis_angle_interval':
+        raise ValueError('Angular-center tangent is only defined for axis_angle_interval')
+    hint = c['parameters']['center_tangent_hint']
+    keys(hint, ('version','frame','direction','source'))
+    if type(hint['version']) is not int or hint['version'] != 1 or hint['frame'] != 'reference':
+        raise ValueError('Unsupported fixed angular-center hint contract')
+    vector(hint['direction'],3,unit=True)
+    source = hint['source']; keys(source, ('kind','recording_id','frame','quaternion_wxyz','sha256'))
+    selected = c['activation'].get('event',{}).get('frame',c['activation']['start'])
+    if (source['kind'] != 'reference_axis_projection' or type(source['frame']) is not int
+            or source['frame'] != selected or source['frame'] < 0
+            or (length is not None and source['frame'] >= length)
+            or not isinstance(source['recording_id'],str) or not source['recording_id'].strip()):
+        raise ValueError('Angular-center hint needs the fixed reference selection-start frame')
+    _normalized_quaternion(source['quaternion_wxyz'])
+    expected = make_center_tangent_hint(c,source['quaternion_wxyz'],source['recording_id'],source['frame'])
+    # Quantized directions must not silently select an unrelated exit branch.
+    if (not isinstance(source['sha256'],str) or source['sha256'] != expected['source']['sha256']
+            or max(abs(a-b) for a,b in zip(hint['direction'],expected['direction'])) > 1e-8):
+        raise ValueError('Angular-center tangent/source hash differs from the fixed reference projection')
+    return hint
+
+
+def validate_reference_center_hints(bundle, handle):
+    """Bind a hint to full-episode HDF5 before chunks discard its source frame."""
+    for c in bundle['constraints']:
+        hint = c['parameters'].get('center_tangent_hint')
+        if hint is None:
+            continue
+        arm = {'left_eef':'left','right_eef':'right'}[c['subject']]
+        q = [float(v) for v in handle[f'endpose/{arm}_endpose'][hint['source']['frame']][3:]]
+        if bundle['action_contract']['quaternion_order'] == 'xyzw':
+            q = [q[3],*q[:3]]
+        expected = make_center_tangent_hint(c,q,bundle['provenance']['recording_id'],hint['source']['frame'])
+        if hint != expected:
+            raise ValueError(f'Angular-center hint {c["id"]} does not match its HDF5 reference orientation')
+
+
 def validate_constraint(c, length=None):
     keys(c, ('id', 'type', 'subject', 'reference_frame', 'parameters', 'activation', 'penalty', 'evidence'))
     if not isinstance(c['id'], str) or not c['id'].strip():
@@ -77,7 +172,8 @@ def validate_constraint(c, length=None):
     if kind == 'window_direction_cone':
         required.update(('window_steps', 'minimum_window_steps', 'minimum_reference_progress_m', 'fallback_radius_m'))
     displacement = kind in ('axis_displacement_interval', 'angular_displacement_interval')
-    optional = (('anchor',) if displacement else ()) + (('local_point',) if kind in LOCAL_POINT_KINDS else ())
+    optional = ((('anchor',) if displacement else ()) + (('local_point',) if kind in LOCAL_POINT_KINDS else ())
+                + (('center_tangent_hint',) if kind == 'axis_angle_interval' else ()))
     keys(p, required, optional)
     if 'local_point' in p:
         validate_local_point(p['local_point'], kind)
@@ -141,12 +237,14 @@ def validate_constraint(c, length=None):
     for key in ('report_id', 'rationale'):
         if not isinstance(evidence[key], str) or not evidence[key].strip():
             raise ValueError('Evidence report and rationale required')
+    if 'center_tangent_hint' in p:
+        validate_center_tangent_hint(c, length=length)
     return c
 
 
 def validate_bundle(bundle, length=None):
     keys(bundle, ('schema_version', 'action_contract', 'provenance', 'constraints'))
-    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', '1.3', '1.4', SCHEMA_VERSION):
+    if bundle['schema_version'] not in ('1.0', '1.1', '1.2', '1.3', '1.4', '1.5', SCHEMA_VERSION):
         raise ValueError('Unsupported embedded constraint schema')
     contract = bundle['action_contract']
     keys(contract, ('position', 'rotation', 'quaternion_order', 'gripper', 'frame'))
@@ -168,17 +266,23 @@ def validate_bundle(bundle, length=None):
         raise ValueError('constraints must be a list of conjunctive base constraints')
     ids = set()
     for c in bundle['constraints']:
-        if 'local_point' in c['parameters'] and bundle['schema_version'] != SCHEMA_VERSION:
+        if 'center_tangent_hint' in c['parameters']:
+            if bundle['schema_version'] != SCHEMA_VERSION:
+                raise ValueError('Fixed angular-center hints require schema 1.6')
+        if 'local_point' in c['parameters'] and bundle['schema_version'] not in ('1.5', SCHEMA_VERSION):
             raise ValueError('Rigid local point constraints require schema 1.5')
-        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', '1.3', '1.4', SCHEMA_VERSION):
+        if 'anchor' in c['parameters'] and bundle['schema_version'] not in ('1.2', '1.3', '1.4', '1.5', SCHEMA_VERSION):
             raise ValueError('Explicit displacement anchors require schema 1.2')
         if c['type'] == 'motion_direction_cone' and bundle['schema_version'] == '1.0':
             raise ValueError('Direction cones require schema 1.1')
-        if c['type'] == 'window_direction_cone' and bundle['schema_version'] not in ('1.3', '1.4', SCHEMA_VERSION):
+        if c['type'] == 'window_direction_cone' and bundle['schema_version'] not in ('1.3', '1.4', '1.5', SCHEMA_VERSION):
             raise ValueError('Window direction cones require schema 1.3')
-        if c['type'] == 'gripper_pair_max_interval' and bundle['schema_version'] not in ('1.4', SCHEMA_VERSION):
+        if c['type'] == 'gripper_pair_max_interval' and bundle['schema_version'] not in ('1.4', '1.5', SCHEMA_VERSION):
             raise ValueError('Joint gripper max constraints require schema 1.4')
         validate_constraint(c, length)
+        if ('center_tangent_hint' in c['parameters'] and
+                c['parameters']['center_tangent_hint']['source']['recording_id'] != provenance['recording_id']):
+            raise ValueError('Angular-center hint belongs to a different reference recording')
         if c['id'] in ids:
             raise ValueError('Duplicate constraint id')
         ids.add(c['id'])
@@ -198,6 +302,7 @@ def read_embedded(handle):
         value = value.decode('utf-8')
     bundle = validate_bundle(json.loads(value), len(handle['endpose/left_endpose']))
     validate_reference_events(bundle, handle)
+    validate_reference_center_hints(bundle, handle)
     return bundle
 
 

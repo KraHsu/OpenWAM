@@ -50,6 +50,8 @@ training:
     timestep_strategy: clean    # Explicit clean-action objective; fm_matched is a separate ablation.
     sigma_floor: 0.05           # fm_matched uses FM weight / max(sigma, floor)^2; not a tuned value.
     penalty_scale_overrides: {} # Per-kind physical scales; never changes the allowed intervals.
+    angle_center_backward: legacy # Opt-in fixed_annotation_v1 requires schema1.6 reference tangent hints.
+    angle_center_log_per_constraint: true # Opt-in only: fixed dataset-wide ID metrics; catalog in provenance.
 
   # --- Flow matching timestep range ---
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)

@@ -3,7 +3,47 @@ import math
 import torch
 
 from openwam.train.action_trajectory import physical_rotation
-from openwam.train.constraint_schema import LOCAL_POINT_KINDS
+from openwam.train.constraint_schema import LOCAL_POINT_KINDS, validate_center_tangent_hint
+
+ANGLE_CENTER_POLICIES = ('legacy', 'fixed_annotation_v1')
+
+
+def interval_axis_angle(axis, target, basis, constraint, policy='legacy', diagnostics=None):
+    """Identical forward; optional limiting-gradient selection at exact alignment.
+
+    A positive-lower angular interval has no ordinary derivative at its center.
+    The frozen tangent chooses one nonzero limiting gradient there. All nonzero
+    cross products retain PyTorch's original derivative, including tiny values;
+    no epsilon neighborhood, changed forward objective, or guessed axis is used.
+    """
+    if policy not in ANGLE_CENTER_POLICIES:
+        raise ValueError('Unknown angular-center backward policy')
+    cross = torch.linalg.cross(axis, target)
+    norm = torch.linalg.vector_norm(cross, dim=-1)
+    dot = (axis*target).sum(-1)
+    if policy == 'fixed_annotation_v1' and constraint['parameters']['bounds'][0] > 0:
+        if 'center_tangent_hint' not in constraint['parameters']:
+            raise ValueError('Positive lower angular bound requires a fixed annotation tangent')
+        hint = validate_center_tangent_hint(constraint)
+        direction = basis @ axis.new_tensor(hint['direction'])
+        cross_hint = torch.linalg.cross(direction.expand_as(target), target)
+        hint_norm = torch.linalg.vector_norm(cross_hint,dim=-1,keepdim=True)
+        if not torch.isfinite(cross_hint).all() or not (hint_norm > 0).all():
+            raise ValueError('Invalid angular-center tangent in decoded physical reference frame')
+        cross_hint = (cross_hint/hint_norm).detach()
+        # Component equality avoids treating a nonzero vector whose norm
+        # underflowed as an exact center. Antiparallel pi singularities are not
+        # this policy's scope; zero lower bounds retain the default behavior.
+        selected = (cross == 0).all(-1) & (dot > 0)
+        # This identically-zero forward term adds only the selected first-order
+        # generalized derivative. Elsewhere its derivative is exactly zero, so
+        # the original vector_norm/atan2 graph remains intact.
+        correction = ((cross-cross.detach())*cross_hint).sum(-1)
+        norm = norm + torch.where(selected, correction, torch.zeros_like(norm))
+        if diagnostics is not None:
+            diagnostics['angle_center_hit_count'] += selected.detach().float().sum()
+            diagnostics['angle_center_hint_frame_count'] += selected.new_tensor(selected.numel(),dtype=torch.float32)
+    return torch.atan2(norm,dot)
 
 
 def frame_rotation(q, like):
@@ -75,7 +115,8 @@ def window_direction_residual(pred, reference, valid, indices, dims, constraint,
     return result
 
 
-def residual(pred, reference, valid, constraint, *, start_frame, rotation_convention):
+def residual(pred, reference, valid, constraint, *, start_frame, rotation_convention,
+             angle_center_backward='legacy', diagnostics=None):
     """Return physical interval violations (m/rad/open fraction), or None.
 
     The tensors include the measured initial state at row 0. Activation and
@@ -172,7 +213,7 @@ def residual(pred, reference, valid, constraint, *, start_frame, rotation_conven
         rotation = physical_rotation(values, rotation_convention)
         axis = (rotation @ values.new_tensor(p['local_axis'])[..., None]).squeeze(-1)
         target = (basis @ values.new_tensor(p['reference_axis'])).expand_as(axis)
-        scalar = torch.atan2(torch.linalg.vector_norm(torch.linalg.cross(axis, target), dim=-1), (axis*target).sum(-1))
+        scalar = interval_axis_angle(axis,target,basis,c,angle_center_backward,diagnostics)
     elif kind == 'angular_displacement_interval':
         rotation = physical_rotation(values, rotation_convention)
         origin = basis if initial is None else physical_rotation(initial, rotation_convention)
